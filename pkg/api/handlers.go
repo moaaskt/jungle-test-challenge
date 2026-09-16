@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
+	"github.com/moaaskt/jungle-test-challenge/pkg/idempotency"
 	"github.com/moaaskt/jungle-test-challenge/pkg/money"
 	"github.com/moaaskt/jungle-test-challenge/pkg/repository"
 	"github.com/moaaskt/jungle-test-challenge/pkg/service"
@@ -117,13 +119,34 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	businessPayload := idempotency.BusinessPayload{
+		ProviderID:            req.ProviderID,
+		ExternalTransactionID: req.ExternalID,
+		PlayerID:              req.PlayerID,
+		WalletID:              req.WalletID,
+		RoundID:               req.RoundID,
+		GameID:                req.GameID,
+		Kind:                  req.Kind,
+		Money: idempotency.MoneyPayload{
+			Amount:   req.Money.Amount,
+			Currency: req.Money.Currency,
+		},
+		ReferenceExternalTransactionID: req.ReferenceExtID,
+	}
+
+	payloadHash, err := idempotency.HashPayload(businessPayload)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, "failed to hash payload")
+		return
+	}
+
 	svcReq := service.ProcessWagerRequest{
 		Origin:         domain.OriginExternal,
 		PlayerID:       req.PlayerID,
 		ProviderID:     &req.ProviderID,
 		ExternalID:     &req.ExternalID,
 		IdempotencyKey: &idemKey,
-		PayloadHash:    nil, // Na Fase 4 faremos o hash completo do request
+		PayloadHash:    &payloadHash,
 		RoundID:        &req.RoundID,
 		GameID:         &req.GameID,
 		Type:           domain.TransactionType(req.Kind),
@@ -131,9 +154,13 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		Currency:       req.Money.Currency,
 	}
 
-	tx, wallet, err := h.wagerService.ProcessWager(r.Context(), svcReq)
-	
+	result, err := h.wagerService.ProcessWager(r.Context(), svcReq)
+
 	if err != nil {
+		if strings.Contains(err.Error(), "idempotency key conflict") {
+			h.respondError(w, http.StatusConflict, err.Error())
+			return
+		}
 		// Mapear erros de domínio para status HTTP adequados
 		if errors.Is(err, domain.ErrInsufficientFunds) || errors.Is(err, domain.ErrCurrencyMismatch) || errors.Is(err, domain.ErrZeroAmountRequired) {
 			h.respondError(w, http.StatusUnprocessableEntity, err.Error())
@@ -147,11 +174,23 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	if result.IdempotentReplay {
+		// Substitui a flag false para true no JSON de resposta
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+
+		var rawMap map[string]any
+		json.Unmarshal(result.RawResponse, &rawMap)
+		rawMap["idempotentReplay"] = true
+		json.NewEncoder(w).Encode(rawMap)
+		return
+	}
+
 	h.respondJSON(w, http.StatusOK, map[string]any{
-		"transactionId":    tx.ID,
-		"status":           tx.Status,
-		"balance":          map[string]string{"amount": wallet.Balance().FormattedAmount(), "currency": wallet.Currency},
-		"idempotentReplay": false, // TODO: mock na fase 4
+		"transactionId":    result.TransactionID,
+		"status":           result.Status,
+		"balance":          map[string]string{"amount": result.Balance.FormattedAmount(), "currency": result.Balance.Currency()},
+		"idempotentReplay": false,
 	})
 }
 
@@ -160,7 +199,7 @@ func (h *Handlers) HandleLiveness(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) HandleReadiness(w http.ResponseWriter, r *http.Request) {
-	// A validação profunda de readiness (ex: ping no BD) será integrada depois, 
+	// A validação profunda de readiness (ex: ping no BD) será integrada depois,
 	// por ora retornamos OK se o servidor HTTP está de pé.
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "READY"})
 }

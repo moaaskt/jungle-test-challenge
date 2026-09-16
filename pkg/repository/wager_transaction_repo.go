@@ -2,10 +2,14 @@ package repository
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
 )
+
+var ErrProviderExternalConflict = errors.New("provider external transaction id conflict")
 
 // WagerTransactionRepository define a interface de persistência para as transações de apostas.
 type WagerTransactionRepository interface {
@@ -52,5 +56,12 @@ func (r *pgxWagerTransactionRepository) Insert(ctx context.Context, tx pgx.Tx, w
 		wt.CreatedAt,
 		wt.UpdatedAt,
 	)
-	return err
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uk_wager_tx_provider_external" {
+			return ErrProviderExternalConflict
+		}
+		return err
+	}
+	return nil
 }
