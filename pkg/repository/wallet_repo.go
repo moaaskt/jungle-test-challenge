@@ -14,6 +14,12 @@ import (
 // ErrNotFound indica que a entidade solicitada não foi encontrada no banco.
 var ErrNotFound = errors.New("entity not found")
 
+// ErrWalletAlreadyExists indica que já existe uma carteira para o jogador e moeda fornecidos.
+var ErrWalletAlreadyExists = errors.New("wallet already exists")
+
+// ErrOptimisticLockFailed indica que a atualização falhou devido a um conflito de versão.
+var ErrOptimisticLockFailed = errors.New("optimistic lock failed")
+
 // WalletRepository define a interface de persistência para Wallet.
 type WalletRepository interface {
 	GetByID(ctx context.Context, tx pgx.Tx, id uuid.UUID) (*domain.Wallet, error)
@@ -105,7 +111,7 @@ func (r *pgxWalletRepository) UpdateBalance(ctx context.Context, tx pgx.Tx, w *d
 	}
 
 	if cmdTag.RowsAffected() == 0 {
-		return errors.New("optimistic lock failed or wallet not found")
+		return ErrOptimisticLockFailed
 	}
 
 	return nil

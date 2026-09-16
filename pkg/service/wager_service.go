@@ -67,7 +67,7 @@ func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string
 		return nil, fmt.Errorf("failed to check existing wallet: %w", err)
 	}
 	if existing != nil {
-		return nil, fmt.Errorf("wallet already exists for player %s and currency %s", playerID, currency)
+		return nil, repository.ErrWalletAlreadyExists
 	}
 
 	w, err := domain.NewWallet(playerID, currency)
@@ -77,29 +77,6 @@ func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string
 
 	if err := s.walletRepo.Insert(ctx, tx, &w); err != nil {
 		return nil, fmt.Errorf("failed to insert wallet: %w", err)
-	}
-
-	// OPENING transaction para o histórico
-	zero := money.MustNew(0, currency)
-	wagerTx, err := domain.NewWagerTransaction(
-		domain.OriginInternal,
-		w.ID,
-		playerID,
-		nil,
-		nil,
-		domain.TransactionTypeOpening,
-		zero,
-		currency,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create opening transaction: %w", err)
-	}
-	
-	// Abertura é imediatamente processada
-	wagerTx.Process()
-
-	if err := s.wagerRepo.Insert(ctx, tx, &wagerTx); err != nil {
-		return nil, fmt.Errorf("failed to insert opening transaction: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

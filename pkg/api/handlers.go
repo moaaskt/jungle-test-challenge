@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
+	"github.com/moaaskt/jungle-test-challenge/pkg/repository"
 	"github.com/moaaskt/jungle-test-challenge/pkg/service"
 )
 
@@ -38,6 +39,10 @@ func (h *Handlers) HandleOpenWallet(w http.ResponseWriter, r *http.Request) {
 
 	wallet, err := h.wagerService.OpenWallet(r.Context(), req.PlayerID, req.Currency)
 	if err != nil {
+		if errors.Is(err, repository.ErrWalletAlreadyExists) {
+			h.respondError(w, http.StatusConflict, err.Error())
+			return
+		}
 		h.respondError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -92,6 +97,10 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		// Mapear erros de domínio para status HTTP adequados
 		if errors.Is(err, domain.ErrInsufficientFunds) || errors.Is(err, domain.ErrCurrencyMismatch) || errors.Is(err, domain.ErrZeroAmountRequired) {
 			h.respondError(w, http.StatusUnprocessableEntity, err.Error())
+			return
+		}
+		if errors.Is(err, repository.ErrOptimisticLockFailed) {
+			h.respondError(w, http.StatusConflict, err.Error())
 			return
 		}
 		h.respondError(w, http.StatusInternalServerError, err.Error())

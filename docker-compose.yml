@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: jungle
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: jungle_test
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/init.sql
