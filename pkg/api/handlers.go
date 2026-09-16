@@ -3,9 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
+	"github.com/moaaskt/jungle-test-challenge/pkg/money"
 	"github.com/moaaskt/jungle-test-challenge/pkg/repository"
 	"github.com/moaaskt/jungle-test-challenge/pkg/service"
 )
@@ -20,9 +22,14 @@ func NewHandlers(wagerService service.WagerService) *Handlers {
 	}
 }
 
-type OpenWalletRequest struct {
-	PlayerID string `json:"player_id"`
+type MoneyDTO struct {
+	Amount   string `json:"amount"`
 	Currency string `json:"currency"`
+}
+
+type OpenWalletRequest struct {
+	PlayerID       string    `json:"playerId"`
+	InitialBalance *MoneyDTO `json:"initialBalance,omitempty"`
 }
 
 func (h *Handlers) HandleOpenWallet(w http.ResponseWriter, r *http.Request) {
@@ -32,12 +39,31 @@ func (h *Handlers) HandleOpenWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.PlayerID == "" || req.Currency == "" {
-		h.respondError(w, http.StatusBadRequest, "player_id and currency are required")
+	if req.PlayerID == "" {
+		h.respondError(w, http.StatusBadRequest, "playerId is required")
 		return
 	}
 
-	wallet, err := h.wagerService.OpenWallet(r.Context(), req.PlayerID, req.Currency)
+	var currency string
+	var initialBalance int64
+	if req.InitialBalance != nil {
+		currency = req.InitialBalance.Currency
+		if req.InitialBalance.Amount != "" {
+			amt, err := money.Parse(req.InitialBalance.Amount, currency)
+			if err != nil {
+				h.respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid initial balance: %v", err))
+				return
+			}
+			initialBalance = amt.Amount()
+		}
+	} else {
+		// Padrão caso não envie initialBalance, mas como o teste não define padrão...
+		// Normalmente precisaria da currency. Se não tem currency, falha.
+		h.respondError(w, http.StatusBadRequest, "initialBalance is required to provide currency")
+		return
+	}
+
+	wallet, err := h.wagerService.OpenWallet(r.Context(), req.PlayerID, currency, initialBalance)
 	if err != nil {
 		if errors.Is(err, repository.ErrWalletAlreadyExists) {
 			h.respondError(w, http.StatusConflict, err.Error())
@@ -48,32 +74,46 @@ func (h *Handlers) HandleOpenWallet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondJSON(w, http.StatusCreated, map[string]any{
-		"id":         wallet.ID,
-		"player_id":  wallet.PlayerID,
-		"currency":   wallet.Currency,
-		"balance":    wallet.Balance().FormattedAmount(),
-		"version":    wallet.Version,
-		"created_at": wallet.CreatedAt,
+		"id":       wallet.ID,
+		"playerId": wallet.PlayerID,
+		"balance":  map[string]string{"amount": wallet.Balance().FormattedAmount(), "currency": wallet.Currency},
+		"version":  wallet.Version,
 	})
 }
 
 type WagerRequest struct {
-	ProviderID     string `json:"provider_id"`
-	ExternalID     string `json:"external_id"`
-	IdempotencyKey string `json:"idempotency_key"`
-	PayloadHash    string `json:"payload_hash"`
-	PlayerID       string `json:"player_id"`
-	RoundID        string `json:"round_id"`
-	GameID         string `json:"game_id"`
-	Type           string `json:"type"`
-	Amount         int64  `json:"amount"` // Em unidades mínimas
-	Currency       string `json:"currency"`
+	ProviderID     string   `json:"providerId"`
+	ExternalID     string   `json:"externalTransactionId"`
+	PlayerID       string   `json:"playerId"`
+	WalletID       string   `json:"walletId"`
+	RoundID        string   `json:"roundId"`
+	GameID         string   `json:"gameId"`
+	Kind           string   `json:"kind"`
+	Money          MoneyDTO `json:"money"`
+	ReferenceExtID *string  `json:"referenceExternalTransactionId,omitempty"`
 }
 
 func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request) {
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey == "" {
+		h.respondError(w, http.StatusBadRequest, "Idempotency-Key header is required")
+		return
+	}
+
 	var req WagerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid request payload")
+		return
+	}
+
+	if req.WalletID == "" {
+		h.respondError(w, http.StatusBadRequest, "walletId is required")
+		return
+	}
+
+	amt, err := money.Parse(req.Money.Amount, req.Money.Currency)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid money: %v", err))
 		return
 	}
 
@@ -82,16 +122,16 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		PlayerID:       req.PlayerID,
 		ProviderID:     &req.ProviderID,
 		ExternalID:     &req.ExternalID,
-		IdempotencyKey: &req.IdempotencyKey,
-		PayloadHash:    &req.PayloadHash,
+		IdempotencyKey: &idemKey,
+		PayloadHash:    nil, // Na Fase 4 faremos o hash completo do request
 		RoundID:        &req.RoundID,
 		GameID:         &req.GameID,
-		Type:           domain.TransactionType(req.Type),
-		Amount:         req.Amount,
-		Currency:       req.Currency,
+		Type:           domain.TransactionType(req.Kind),
+		Amount:         amt.Amount(),
+		Currency:       req.Money.Currency,
 	}
 
-	tx, err := h.wagerService.ProcessWager(r.Context(), svcReq)
+	tx, wallet, err := h.wagerService.ProcessWager(r.Context(), svcReq)
 	
 	if err != nil {
 		// Mapear erros de domínio para status HTTP adequados
@@ -108,11 +148,10 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 	}
 
 	h.respondJSON(w, http.StatusOK, map[string]any{
-		"transaction_id": tx.ID,
-		"status":         tx.Status,
-		"amount":         tx.Amount.FormattedAmount(),
-		"currency":       tx.Currency,
-		"failure_code":   tx.FailureCode,
+		"transactionId":    tx.ID,
+		"status":           tx.Status,
+		"balance":          map[string]string{"amount": wallet.Balance().FormattedAmount(), "currency": wallet.Currency},
+		"idempotentReplay": false, // TODO: mock na fase 4
 	})
 }
 

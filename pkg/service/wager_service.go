@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
@@ -12,10 +13,10 @@ import (
 )
 
 type WagerService interface {
-	OpenWallet(ctx context.Context, playerID, currency string) (*domain.Wallet, error)
+	OpenWallet(ctx context.Context, playerID, currency string, initialBalance int64) (*domain.Wallet, error)
 	// ProcessWager será expandido nas próximas fases para suportar idempotência, outbox e concurrency handling.
 	// Por enquanto, executa o fluxo básico síncrono.
-	ProcessWager(ctx context.Context, req ProcessWagerRequest) (*domain.WagerTransaction, error)
+	ProcessWager(ctx context.Context, req ProcessWagerRequest) (*domain.WagerTransaction, *domain.Wallet, error)
 }
 
 type ProcessWagerRequest struct {
@@ -53,7 +54,7 @@ func NewWagerService(
 	}
 }
 
-func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string) (*domain.Wallet, error) {
+func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string, initialBalance int64) (*domain.Wallet, error) {
 	// Inicia transação SQL (Unit of Work)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -72,11 +73,60 @@ func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string
 
 	w, err := domain.NewWallet(playerID, currency)
 	if err != nil {
-		return nil, fmt.Errorf("domain validation failed: %w", err)
+		return nil, fmt.Errorf("failed to create wallet: %w", err)
+	}
+
+	var entry *domain.WalletLedgerEntry
+	var wagerTx *domain.WagerTransaction
+
+	if initialBalance > 0 {
+		amt, err := money.New(initialBalance, currency)
+		if err != nil {
+			return nil, fmt.Errorf("invalid initial balance: %w", err)
+		}
+
+		e, err := w.Credit(amt, uuid.Nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to credit initial balance: %w", err)
+		}
+		
+		// Força a versão de volta para 1, conforme regra de abertura
+		w.Version = 1
+		
+		entry = &e
+
+		txW, err := domain.NewWagerTransaction(
+			domain.OriginInternal,
+			w.ID,
+			playerID,
+			nil,
+			nil,
+			domain.TransactionTypeOpening,
+			amt,
+			currency,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create opening transaction: %w", err)
+		}
+		
+		txW.Process()
+		
+		// Atualizar o ID da transação no ledger entry
+		entry.TransactionID = txW.ID
+		wagerTx = &txW
 	}
 
 	if err := s.walletRepo.Insert(ctx, tx, &w); err != nil {
 		return nil, fmt.Errorf("failed to insert wallet: %w", err)
+	}
+
+	if wagerTx != nil {
+		if err := s.wagerRepo.Insert(ctx, tx, wagerTx); err != nil {
+			return nil, fmt.Errorf("failed to insert opening transaction: %w", err)
+		}
+		if err := s.ledgerRepo.Insert(ctx, tx, entry); err != nil {
+			return nil, fmt.Errorf("failed to insert opening ledger entry: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -86,10 +136,10 @@ func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string
 	return &w, nil
 }
 
-func (s *wagerService) ProcessWager(ctx context.Context, req ProcessWagerRequest) (*domain.WagerTransaction, error) {
+func (s *wagerService) ProcessWager(ctx context.Context, req ProcessWagerRequest) (*domain.WagerTransaction, *domain.Wallet, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+		return nil, nil, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -97,15 +147,15 @@ func (s *wagerService) ProcessWager(ctx context.Context, req ProcessWagerRequest
 	w, err := s.walletRepo.GetByPlayerAndCurrency(ctx, tx, req.PlayerID, req.Currency)
 	if err != nil {
 		if err == repository.ErrNotFound {
-			return nil, fmt.Errorf("wallet not found for player %s and currency %s", req.PlayerID, req.Currency)
+			return nil, nil, fmt.Errorf("wallet not found for player %s and currency %s", req.PlayerID, req.Currency)
 		}
-		return nil, fmt.Errorf("failed to get wallet: %w", err)
+		return nil, nil, fmt.Errorf("failed to get wallet: %w", err)
 	}
 
 	// 2. Criar a transação do domínio
 	amount, err := money.New(req.Amount, req.Currency)
 	if err != nil {
-		return nil, fmt.Errorf("invalid amount: %w", err)
+		return nil, nil, fmt.Errorf("invalid amount: %w", err)
 	}
 
 	wagerTx, err := domain.NewWagerTransaction(
@@ -121,7 +171,7 @@ func (s *wagerService) ProcessWager(ctx context.Context, req ProcessWagerRequest
 		domain.WithGameContext(safeDeref(req.RoundID), safeDeref(req.GameID)),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("domain validation failed: %w", err)
+		return nil, nil, fmt.Errorf("domain validation failed: %w", err)
 	}
 
 	// 3. Aplicar a operação na carteira (Debitar ou Creditar dependendo do tipo)
@@ -138,44 +188,44 @@ func (s *wagerService) ProcessWager(ctx context.Context, req ProcessWagerRequest
 	default:
 		// Para REFUND/ROLLBACK, lógica será implementada na fase 8. 
 		// Por ora, vamos retornar um erro de não implementado.
-		return nil, fmt.Errorf("transaction type %s not fully supported in this phase", req.Type)
+		return nil, nil, fmt.Errorf("transaction type %s not fully supported in this phase", req.Type)
 	}
 
 	if opErr != nil {
 		wagerTx.Reject(opErr.Error())
 		// Salva apenas a transação rejeitada
 		if err := s.wagerRepo.Insert(ctx, tx, &wagerTx); err != nil {
-			return nil, fmt.Errorf("failed to insert rejected transaction: %w", err)
+			return nil, nil, fmt.Errorf("failed to insert rejected transaction: %w", err)
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("failed to commit: %w", err)
+			return nil, nil, fmt.Errorf("failed to commit: %w", err)
 		}
-		return &wagerTx, opErr // Retorna o erro de domínio para o handler
+		return &wagerTx, w, opErr // Retorna o erro de domínio para o handler
 	}
 
 	wagerTx.Process()
 
 	// 4. Salvar tudo
 	if err := s.walletRepo.UpdateBalance(ctx, tx, w); err != nil {
-		return nil, fmt.Errorf("failed to update wallet balance: %w", err)
+		return nil, nil, fmt.Errorf("failed to update wallet balance: %w", err)
 	}
 
 	if err := s.wagerRepo.Insert(ctx, tx, &wagerTx); err != nil {
-		return nil, fmt.Errorf("failed to insert transaction: %w", err)
+		return nil, nil, fmt.Errorf("failed to insert transaction: %w", err)
 	}
 
 	// Se for LOSS, entry.ID será nil (zero UUID)
 	if !wagerTx.IsLoss() {
 		if err := s.ledgerRepo.Insert(ctx, tx, &entry); err != nil {
-			return nil, fmt.Errorf("failed to insert ledger entry: %w", err)
+			return nil, nil, fmt.Errorf("failed to insert ledger entry: %w", err)
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+		return nil, nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	return &wagerTx, nil
+	return &wagerTx, w, nil
 }
 
 func safeDeref(s *string) string {
