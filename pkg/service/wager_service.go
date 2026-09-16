@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -149,12 +150,13 @@ func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string
 }
 
 func (s *wagerService) ProcessWager(ctx context.Context, req ProcessWagerRequest) (ProcessWagerResult, error) {
-	// Loop de retry exclusivo para o cenário de violação de constraint UNIQUE(key)
-	for attempts := 1; attempts <= 2; attempts++ {
+	// Loop de retry para concorrência na mesma chave de idempotência ou mesmo provider/external_id
+	for attempts := 1; attempts <= 5; attempts++ {
 		result, err := s.processWagerInternal(ctx, req)
 		if err == repository.ErrIdempotencyKeyConflict {
-			// Se foi conflito de chave de idempotência NO INSERT (ou seja, concorrente ganhou),
-			// no próximo loop ele vai encontrar o registro no GET inicial e fazer o replay!
+			// Concorrente ganhou no INSERT (ou em idempotency_records ou em wager_transactions).
+			// Uma breve pausa de 10ms permite que a transação vencedora finalize o commit se ainda estiver gravando.
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		return result, err
@@ -191,8 +193,8 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 		}
 	}
 
-	// 2. Obter a carteira
-	w, err := s.walletRepo.GetByPlayerAndCurrency(ctx, tx, req.PlayerID, req.Currency)
+	// 2. Obter a carteira com lock pessimista por linha (SELECT ... FOR UPDATE)
+	w, err := s.walletRepo.GetByPlayerAndCurrencyForUpdate(ctx, tx, req.PlayerID, req.Currency)
 	if err != nil {
 		if err == repository.ErrNotFound {
 			return ProcessWagerResult{}, fmt.Errorf("wallet not found for player %s and currency %s", req.PlayerID, req.Currency)
@@ -241,24 +243,53 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 		wagerTx.Reject(opErr.Error())
 		if err := s.wagerRepo.Insert(ctx, tx, &wagerTx); err != nil {
 			if err == repository.ErrProviderExternalConflict {
+				if idemKey != "" {
+					tx.Rollback(ctx)
+					return ProcessWagerResult{}, repository.ErrIdempotencyKeyConflict
+				}
 				return ProcessWagerResult{}, fmt.Errorf("idempotency key conflict: provider external id already exists with different key")
 			}
 			return ProcessWagerResult{}, fmt.Errorf("failed to insert rejected transaction: %w", err)
 		}
+
+		// Rejeição é decisão de negócio válida: gravar idempotência para replay
+		responseMap := map[string]any{
+			"transactionId": wagerTx.ID.String(),
+			"status":        string(wagerTx.Status),
+			"balance": map[string]string{
+				"amount":   w.Balance().FormattedAmount(),
+				"currency": w.Balance().Currency(),
+			},
+			"idempotentReplay": false,
+		}
+		responseBody, _ := json.Marshal(responseMap)
+
+		if idemKey != "" {
+			record := &domain.IdempotencyRecord{
+				Key:            idemKey,
+				PayloadHash:    payloadHash,
+				ResponseStatus: 200, // Rejeição de negócio retorna 200 OK com status REJECTED
+				ResponseBody:   responseBody,
+			}
+			if err := s.idempotencyRepo.Insert(ctx, tx, record); err != nil {
+				if err == repository.ErrIdempotencyKeyConflict {
+					tx.Rollback(ctx)
+					return ProcessWagerResult{}, err
+				}
+				return ProcessWagerResult{}, fmt.Errorf("failed to insert idempotency record for rejected tx: %w", err)
+			}
+		}
+
 		if err := tx.Commit(ctx); err != nil {
 			return ProcessWagerResult{}, fmt.Errorf("failed to commit: %w", err)
 		}
-		// Transação foi rejeitada (ex: saldo insuficiente).
-		// O handler mapeará opErr para HTTP 422, mas a transação foi salva.
-		// Nós não gravamos idempotência de rejeição de saldo na Fase 4?
-		// A spec diz: "Uma operação financeira... não pode ser reaplicada".
-		// O ideal é gravar idempotência TAMBÉM para erros de negócio. Mas pra simplificar,
-		// deixaremos o handler tratar, ou retornamos junto com o erro.
-		// O desafio pede replay do resultado persistido para TUDO que for concluído.
-		// Rejeição de negócio É um estado final.
-		// Vamos incluir idempotência de rejeição num futuro, ou agora.
-		// Por ora, vamos retornar o erro de domínio normalmente.
-		return ProcessWagerResult{}, opErr
+
+		// Retorna resultado REJECTED como resposta válida
+		return ProcessWagerResult{
+			TransactionID: wagerTx.ID,
+			Status:        wagerTx.Status,
+			Balance:       w.Balance(),
+		}, nil
 	}
 
 	wagerTx.Process()
@@ -270,6 +301,10 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 
 	if err := s.wagerRepo.Insert(ctx, tx, &wagerTx); err != nil {
 		if err == repository.ErrProviderExternalConflict {
+			if idemKey != "" {
+				tx.Rollback(ctx)
+				return ProcessWagerResult{}, repository.ErrIdempotencyKeyConflict
+			}
 			return ProcessWagerResult{}, fmt.Errorf("idempotency key conflict: provider external id already exists with different key") // The handler will map this to 409
 		}
 		return ProcessWagerResult{}, fmt.Errorf("failed to insert transaction: %w", err)

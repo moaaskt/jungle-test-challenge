@@ -23,7 +23,9 @@ var ErrOptimisticLockFailed = errors.New("optimistic lock failed")
 // WalletRepository define a interface de persistência para Wallet.
 type WalletRepository interface {
 	GetByID(ctx context.Context, tx pgx.Tx, id uuid.UUID) (*domain.Wallet, error)
+	GetByIDForUpdate(ctx context.Context, tx pgx.Tx, id uuid.UUID) (*domain.Wallet, error)
 	GetByPlayerAndCurrency(ctx context.Context, tx pgx.Tx, playerID, currency string) (*domain.Wallet, error)
+	GetByPlayerAndCurrencyForUpdate(ctx context.Context, tx pgx.Tx, playerID, currency string) (*domain.Wallet, error)
 	Insert(ctx context.Context, tx pgx.Tx, w *domain.Wallet) error
 	UpdateBalance(ctx context.Context, tx pgx.Tx, w *domain.Wallet) error
 }
@@ -43,11 +45,31 @@ func (r *pgxWalletRepository) GetByID(ctx context.Context, tx pgx.Tx, id uuid.UU
 	return r.scanRow(ctx, tx.QueryRow(ctx, query, id))
 }
 
+func (r *pgxWalletRepository) GetByIDForUpdate(ctx context.Context, tx pgx.Tx, id uuid.UUID) (*domain.Wallet, error) {
+	query := `
+		SELECT id, player_id, currency, balance, version, created_at, updated_at
+		FROM wallets
+		WHERE id = $1
+		FOR UPDATE
+	`
+	return r.scanRow(ctx, tx.QueryRow(ctx, query, id))
+}
+
 func (r *pgxWalletRepository) GetByPlayerAndCurrency(ctx context.Context, tx pgx.Tx, playerID, currency string) (*domain.Wallet, error) {
 	query := `
 		SELECT id, player_id, currency, balance, version, created_at, updated_at
 		FROM wallets
 		WHERE player_id = $1 AND currency = $2
+	`
+	return r.scanRow(ctx, tx.QueryRow(ctx, query, playerID, currency))
+}
+
+func (r *pgxWalletRepository) GetByPlayerAndCurrencyForUpdate(ctx context.Context, tx pgx.Tx, playerID, currency string) (*domain.Wallet, error) {
+	query := `
+		SELECT id, player_id, currency, balance, version, created_at, updated_at
+		FROM wallets
+		WHERE player_id = $1 AND currency = $2
+		FOR UPDATE
 	`
 	return r.scanRow(ctx, tx.QueryRow(ctx, query, playerID, currency))
 }
