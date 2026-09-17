@@ -49,6 +49,7 @@ type wagerService struct {
 	wagerRepo       repository.WagerTransactionRepository
 	ledgerRepo      repository.LedgerRepository
 	idempotencyRepo repository.IdempotencyRepository
+	outboxRepo      repository.OutboxRepository
 }
 
 func NewWagerService(
@@ -57,6 +58,7 @@ func NewWagerService(
 	wagerRepo repository.WagerTransactionRepository,
 	ledgerRepo repository.LedgerRepository,
 	idempotencyRepo repository.IdempotencyRepository,
+	outboxRepo repository.OutboxRepository,
 ) WagerService {
 	return &wagerService{
 		pool:            pool,
@@ -64,6 +66,7 @@ func NewWagerService(
 		wagerRepo:       wagerRepo,
 		ledgerRepo:      ledgerRepo,
 		idempotencyRepo: idempotencyRepo,
+		outboxRepo:      outboxRepo,
 	}
 }
 
@@ -139,6 +142,34 @@ func (s *wagerService) OpenWallet(ctx context.Context, playerID, currency string
 		}
 		if err := s.ledgerRepo.Insert(ctx, tx, entry); err != nil {
 			return nil, fmt.Errorf("failed to insert opening ledger entry: %w", err)
+		}
+
+		// Gravação atômica na outbox (Seção 9 da spec)
+		evProcessed, err := domain.NewWagerTransactionProcessedOutboxEvent(wagerTx, wagerTx.ID.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create opening processed outbox event: %w", err)
+		}
+		if err := s.outboxRepo.Insert(ctx, tx, evProcessed); err != nil {
+			return nil, fmt.Errorf("failed to insert opening processed outbox event: %w", err)
+		}
+
+		zeroMoney, _ := money.New(0, currency)
+		evBalance, err := domain.NewWalletBalanceChangedOutboxEvent(
+			w.ID,
+			wagerTx.ID,
+			"CREDIT",
+			entry.Amount,
+			zeroMoney,
+			entry.BalanceAfter,
+			1, // versão na abertura é 1
+			wagerTx.ID.String(),
+			nil,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create opening balance outbox event: %w", err)
+		}
+		if err := s.outboxRepo.Insert(ctx, tx, evBalance); err != nil {
+			return nil, fmt.Errorf("failed to insert opening balance outbox event: %w", err)
 		}
 	}
 
@@ -227,6 +258,17 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 	// 4. Aplicar a operação na carteira
 	var entry domain.WalletLedgerEntry
 	var opErr error
+	balanceBefore := w.Balance()
+
+	correlationID := idemKey
+	if correlationID == "" {
+		if req.ExternalID != nil && *req.ExternalID != "" {
+			correlationID = *req.ExternalID
+		} else {
+			correlationID = wagerTx.ID.String()
+		}
+	}
+	var causationID *string = nil
 
 	switch req.Type {
 	case domain.TransactionTypeBet:
@@ -250,6 +292,15 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 				return ProcessWagerResult{}, fmt.Errorf("idempotency key conflict: provider external id already exists with different key")
 			}
 			return ProcessWagerResult{}, fmt.Errorf("failed to insert rejected transaction: %w", err)
+		}
+
+		// Gravar evento de outbox para rejeição de negócio
+		evRejected, err := domain.NewWagerTransactionRejectedOutboxEvent(&wagerTx, correlationID, causationID)
+		if err != nil {
+			return ProcessWagerResult{}, fmt.Errorf("failed to create rejected outbox event: %w", err)
+		}
+		if err := s.outboxRepo.Insert(ctx, tx, evRejected); err != nil {
+			return ProcessWagerResult{}, fmt.Errorf("failed to insert rejected outbox event: %w", err)
 		}
 
 		// Rejeição é decisão de negócio válida: gravar idempotência para replay
@@ -295,8 +346,10 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 	wagerTx.Process()
 
 	// 5. Salvar agregados
-	if err := s.walletRepo.UpdateBalance(ctx, tx, w); err != nil {
-		return ProcessWagerResult{}, fmt.Errorf("failed to update wallet balance: %w", err)
+	if !wagerTx.IsLoss() {
+		if err := s.walletRepo.UpdateBalance(ctx, tx, w); err != nil {
+			return ProcessWagerResult{}, fmt.Errorf("failed to update wallet balance: %w", err)
+		}
 	}
 
 	if err := s.wagerRepo.Insert(ctx, tx, &wagerTx); err != nil {
@@ -313,6 +366,39 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 	if !wagerTx.IsLoss() {
 		if err := s.ledgerRepo.Insert(ctx, tx, &entry); err != nil {
 			return ProcessWagerResult{}, fmt.Errorf("failed to insert ledger entry: %w", err)
+		}
+	}
+
+	// 6. Gravar eventos de Outbox (WagerTransactionProcessed e WalletBalanceChanged)
+	evProcessed, err := domain.NewWagerTransactionProcessedOutboxEvent(&wagerTx, correlationID, causationID)
+	if err != nil {
+		return ProcessWagerResult{}, fmt.Errorf("failed to create processed outbox event: %w", err)
+	}
+	if err := s.outboxRepo.Insert(ctx, tx, evProcessed); err != nil {
+		return ProcessWagerResult{}, fmt.Errorf("failed to insert processed outbox event: %w", err)
+	}
+
+	if !wagerTx.IsLoss() {
+		dir := "DEBIT"
+		if req.Type == domain.TransactionTypeWin {
+			dir = "CREDIT"
+		}
+		evBalance, err := domain.NewWalletBalanceChangedOutboxEvent(
+			w.ID,
+			wagerTx.ID,
+			dir,
+			amount,
+			balanceBefore,
+			w.Balance(),
+			w.Version,
+			correlationID,
+			causationID,
+		)
+		if err != nil {
+			return ProcessWagerResult{}, fmt.Errorf("failed to create balance changed outbox event: %w", err)
+		}
+		if err := s.outboxRepo.Insert(ctx, tx, evBalance); err != nil {
+			return ProcessWagerResult{}, fmt.Errorf("failed to insert balance changed outbox event: %w", err)
 		}
 	}
 

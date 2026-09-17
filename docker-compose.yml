@@ -10,4 +10,5 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./migrations/000002_add_outbox_leasing.up.sql:/docker-entrypoint-initdb.d/02_outbox.sql

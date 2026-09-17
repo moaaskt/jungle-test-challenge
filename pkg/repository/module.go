@@ -8,4 +8,5 @@ var Module = fx.Provide(
 	NewWagerTransactionRepository,
 	NewLedgerRepository,
 	NewIdempotencyRepository,
+	NewOutboxRepository,
 )
