@@ -16,9 +16,12 @@ var Module = fx.Options(
 		NewOutboxRelayer,
 		DefaultPendingRefResolverConfig,
 		NewPendingRefResolver,
+		DefaultStaleTxRecoveryConfig,
+		NewStaleTxRecoveryWorker,
 	),
 	fx.Invoke(registerOutboxRelayerLifecycle),
 	fx.Invoke(registerPendingRefResolverLifecycle),
+	fx.Invoke(registerStaleTxRecoveryWorkerLifecycle),
 )
 
 func registerOutboxRelayerLifecycle(lc fx.Lifecycle, relayer *OutboxRelayer) {
@@ -41,6 +44,19 @@ func registerPendingRefResolverLifecycle(lc fx.Lifecycle, resolver *PendingRefRe
 		},
 		OnStop: func(ctx context.Context) error {
 			resolver.Stop()
+			return nil
+		},
+	})
+}
+
+func registerStaleTxRecoveryWorkerLifecycle(lc fx.Lifecycle, worker *StaleTxRecoveryWorker) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			worker.Start(context.Background())
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			worker.Stop()
 			return nil
 		},
 	})

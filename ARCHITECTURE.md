@@ -221,9 +221,68 @@ O edital define: *"Provedores acessam apenas suas próprias transações, inclus
 | `/wallets` | `POST` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
 | `/wallets/{walletId}` | `GET` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
 | `/wallets/{walletId}/ledger` | `GET` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/wallets/{walletId}/reconciliation` | `POST` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
 | `/wagering/transactions` | `POST` | Provedor do Payload ou `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
 | `/wagering/transactions/{id}` | `GET` | Provedor Dono da Tx ou `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
 | `/providers/{providerId}/wagering/transactions/{extId}` | `GET` | Provedor do Path ou `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/metrics` | `GET` | Público (Bypass) | `200 OK` | `200 OK` | `200 OK` |
+
+---
+
+## 10. Reconciliação Financeira, Observabilidade e Recuperação de Pendências (Seções 9, 12 e 13)
+
+### 10.1. Reconciliação Financeira e Invariante de Não-Mutação
+A Seção 9 do edital prescreve o endpoint:
+```http
+POST /wallets/:walletId/reconciliation
+```
+1. **Reconstrução Atômica via Ledger**: O saldo da carteira é reconstruído somando todos os créditos e subtraindo todos os débitos históricos persistidos na tabela imutável `wallet_ledger_entries` através de agregação SQL em centavos (`int64`):
+   ```sql
+   SELECT 
+       COALESCE(SUM(CASE WHEN type = 'CREDIT' THEN amount ELSE 0 END), 0) -
+       COALESCE(SUM(CASE WHEN type = 'DEBIT' THEN amount ELSE 0 END), 0) AS calculated_balance,
+       COUNT(*) AS checked_entries
+   FROM wallet_ledger_entries
+   WHERE wallet_id = $1
+   ```
+2. **Visão Consistente no Banco de Dados**: A leitura do saldo armazenado (`wallet.Balance()`) e a reconstrução agregada do ledger ocorrem rigorosamente sob a mesma transação SQL (`pgx.Tx` com nível de isolamento `ReadCommitted`), eliminando anomalias de leituras fantasmas durante commits simultâneos de apostas.
+3. **Precisão de Money sem Ponto Flutuante**: O cálculo da diferença:
+   $$\text{difference} = \text{storedBalance} - \text{calculatedBalance}$$
+   é executado exclusivamente através do método de domínio `storedBalance.Sub(calculatedBalance)` da struct `money.Money`. O valor da diferença mantém a mesma moeda ISO 4217 da carteira e respeita a restrição eliminatória absoluta contra ponto flutuante (`float32`/`float64`).
+4. **Invariante Mandatório (Seção 9)**: A reconciliação **NUNCA altera o saldo da carteira**, mesmo em casos de divergência. Em vez de mutação forçada, a inconsistência é:
+   - Reportada no payload HTTP (`"consistent": false, "difference": { ... }`).
+   - Registrada com aviso nos logs estruturados JSON (`slog.WarnContext`).
+   - Contabilizada no Prometheus através do incremento da métrica `reconciliation_divergences_total`.
+5. **Isolamento de Acesso**: Endpoint restrito exclusivamente ao `internal-service` via middleware `auth.RequireInternal()`. Provedores externos de jogos recebem **`403 Forbidden`**.
+
+### 10.2. Catálogo Operacional de Métricas Prometheus (`/metrics`)
+Conforme a Seção 12 do edital, o endpoint público `/metrics` exporta métricas instrumentadas via `client_golang/prometheus` e `promauto`:
+- `wager_transactions_total` (`CounterVec`, labels: `status`, `kind`, `provider`): volume e status de apostas processadas.
+- `wager_duplicates_total` (`CounterVec`, labels: `origin`): tentativas de replay idempotente deduplicadas em HTTP e SQS.
+- `sqs_retries_total` (`CounterVec`, labels: `queue`): número de retentativas de consumo de mensagens no SQS.
+- `sqs_dlq_total` (`CounterVec`, labels: `queue`): volume de mensagens encaminhadas à fila de cartas mortas.
+- `concurrency_conflicts_total` (`CounterVec`, labels: `type`): colisões de concorrência e optimistic lock.
+- `outbox_lag_seconds` (`Gauge`): atraso em segundos entre criação na outbox e publicação efetiva no broker.
+- `wager_processing_duration_seconds` (`HistogramVec`, labels: `kind`): latência de ponta a ponta na execução financeira.
+- `reconciliation_divergences_total` (`Counter`): total de divergências detectadas pelo endpoint de reconciliação.
+
+Todas as séries padrão são pré-inicializadas no bootstrap (`init()`) para que o scraping do Prometheus encontre todas as métricas ativas imediatamente, sem gerar estados de `No Data` em dashboards e alertas.
+
+### 10.3. Health Checks Profundos (`/health/live` e `/health/ready`)
+Os endpoints atendem à Seção 9 do edital:
+- `GET /health/live`: Verifica a liveness básica do processo Go HTTP. Retorna `200 OK` com `{"status": "UP"}`.
+- `GET /health/ready`: Executa validação ativa em tempo real dos componentes essenciais:
+  - **PostgreSQL**: Executa `pool.Ping(ctx)`.
+  - **SQS**: Executa `sqsClient.ListQueues(ctx, &sqs.ListQueuesInput{MaxResults: 1})`.
+  - Se ambos estiverem operacionais, retorna `200 OK` com `{"status": "READY", "database": "UP", "sqs": "UP"}`. Caso qualquer dependência falhe, retorna `503 Service Unavailable` com `{"status": "DOWN", ...}`.
+
+### 10.4. Recuperação de Transações Presas em PENDING (`StaleTxRecoveryWorker`)
+Em conformidade com a Seção 13, item 8 e OBS-01 (*"Transações em PENDING: Devem possuir mecanismo de recuperação/timeout após interrupção abrupta de processo"*):
+- O worker [`StaleTxRecoveryWorker`](file:///home/moa-dev/projetos/jungletest/pkg/service/stale_tx_recovery_worker.go) executa polling periódico (default: a cada 5s) identificando transações em `PENDING` que excederam o limiar de timeout (default: 30s) sem terem sido finalizadas devido a crash ou queda abrupta da aplicação.
+- Utiliza **`FOR UPDATE SKIP LOCKED`** para coordenação segura em deploys concorrentes com múltiplas instâncias.
+- **Resolução Segura**:
+  - Se a transação já possuir lançamento no ledger (`wallet_ledger_entries`), significa que o débito/crédito ocorreu no banco mas a conexão caiu antes de atualizar o status; a transação é promovida com segurança para `PROCESSED`.
+  - Se não houver lançamento no ledger, o processo crashou antes de efetivar o movimento na carteira; a transação é marcada como `FAILED` com `failureCode: "TRANSACTION_TIMEOUT"`, desbloqueando o ciclo de vida de forma atômica e consistente.
 
 
 

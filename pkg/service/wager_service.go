@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,16 @@ type WagerService interface {
 	GetTransaction(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error)
 	GetTransactionByExternal(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error)
 	GetLedger(ctx context.Context, walletID uuid.UUID, currency string, cursor *repository.LedgerCursor, limit int) ([]*domain.WalletLedgerEntry, *repository.LedgerCursor, error)
+	ReconcileWallet(ctx context.Context, walletID uuid.UUID) (*ReconciliationReport, error)
+}
+
+type ReconciliationReport struct {
+	WalletID          uuid.UUID
+	StoredBalance     money.Money
+	CalculatedBalance money.Money
+	Difference        money.Money
+	Consistent        bool
+	CheckedEntries    int
 }
 
 type ProcessWagerResult struct {
@@ -1064,4 +1075,71 @@ func (s *wagerService) GetLedger(ctx context.Context, walletID uuid.UUID, curren
 	}
 	return entries, nextCursor, nil
 }
+
+// ReconcileWallet reconstrói o saldo a partir dos lançamentos do ledger da carteira,
+// compara com o saldo persistido sob uma visão consistente dos dados e reporta divergências.
+// Invariante Mandatório (Seção 9): A reconciliação NUNCA altera o saldo da carteira.
+func (s *wagerService) ReconcileWallet(ctx context.Context, walletID uuid.UUID) (*ReconciliationReport, error) {
+	// Abertura de transação SQL para garantir visão consistente isolada (sem leituras fantasmas)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction for reconciliation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 1. Obter a carteira e seu saldo persistido
+	wallet, err := s.walletRepo.GetByID(ctx, tx, walletID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, repository.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get wallet: %w", err)
+	}
+
+	// 2. Reconstruir o saldo somando créditos e subtraindo débitos do ledger
+	calculatedAmount, checkedEntries, err := s.ledgerRepo.ReconstructBalance(ctx, tx, walletID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reconstruct balance from ledger: %w", err)
+	}
+
+	storedBalance := wallet.Balance()
+	calculatedBalance, err := money.New(calculatedAmount, wallet.Currency)
+	if err != nil {
+		return nil, fmt.Errorf("invalid reconstructed balance amount: %w", err)
+	}
+
+	// 3. difference = storedBalance - calculatedBalance utilizando o método de domínio Sub() sem floats
+	difference, err := storedBalance.Sub(calculatedBalance)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate balance difference: %w", err)
+	}
+
+	consistent := difference.IsZero()
+
+	// 4. Se houver divergência, registrar log estruturado com aviso
+	if !consistent {
+		slog.WarnContext(ctx, "Reconciliation divergence detected",
+			"walletId", walletID.String(),
+			"storedBalance", storedBalance.FormattedAmount(),
+			"calculatedBalance", calculatedBalance.FormattedAmount(),
+			"difference", difference.FormattedAmount(),
+			"checkedEntries", checkedEntries,
+		)
+	}
+
+	// Comita a transação consistente de leitura (garantindo que não houve mutação de saldo)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit reconciliation transaction: %w", err)
+	}
+
+	return &ReconciliationReport{
+		WalletID:          walletID,
+		StoredBalance:     storedBalance,
+		CalculatedBalance: calculatedBalance,
+		Difference:        difference,
+		Consistent:        consistent,
+		CheckedEntries:    checkedEntries,
+	}, nil
+}
+
 

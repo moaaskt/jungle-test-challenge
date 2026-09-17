@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/moaaskt/jungle-test-challenge/pkg/metrics"
 	"github.com/moaaskt/jungle-test-challenge/pkg/repository"
 )
 
@@ -157,6 +158,8 @@ func (r *OutboxRelayer) ProcessBatch(ctx context.Context) (int, error) {
 			if err := r.repo.MarkPublished(ctx, ev.ID); err != nil {
 				log.Printf("[OUTBOX ERROR] failed to mark published for event %s: %v", ev.ID, err)
 			}
+			lag := time.Since(ev.CreatedAt).Seconds()
+			metrics.OutboxLagSeconds.Set(lag)
 			processedCount++
 		} else {
 			// Calcular backoff exponencial: base * 2^(retry_count - 1)

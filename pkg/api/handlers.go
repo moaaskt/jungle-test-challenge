@@ -1,17 +1,23 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/moaaskt/jungle-test-challenge/pkg/auth"
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
 	"github.com/moaaskt/jungle-test-challenge/pkg/idempotency"
+	"github.com/moaaskt/jungle-test-challenge/pkg/metrics"
 	"github.com/moaaskt/jungle-test-challenge/pkg/money"
 	"github.com/moaaskt/jungle-test-challenge/pkg/repository"
 	"github.com/moaaskt/jungle-test-challenge/pkg/service"
@@ -19,12 +25,20 @@ import (
 
 type Handlers struct {
 	wagerService service.WagerService
+	pool         *pgxpool.Pool
+	sqsClient    *sqs.Client
 }
 
 func NewHandlers(wagerService service.WagerService) *Handlers {
 	return &Handlers{
 		wagerService: wagerService,
 	}
+}
+
+func (h *Handlers) WithHealthDependencies(pool *pgxpool.Pool, sqsClient *sqs.Client) *Handlers {
+	h.pool = pool
+	h.sqsClient = sqsClient
+	return h
 }
 
 type MoneyDTO struct {
@@ -99,6 +113,7 @@ type WagerRequest struct {
 }
 
 func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	idemKey := r.Header.Get("Idempotency-Key")
 	if idemKey == "" {
 		h.respondError(w, http.StatusBadRequest, "Idempotency-Key header is required")
@@ -168,6 +183,7 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 	}
 
 	result, err := h.wagerService.ProcessWager(r.Context(), svcReq)
+	metrics.ProcessingDuration.WithLabelValues(req.Kind).Observe(time.Since(start).Seconds())
 
 	if err != nil {
 		if errors.Is(err, domain.ErrCrossProviderReplay) {
@@ -175,15 +191,18 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if strings.Contains(err.Error(), "idempotency key conflict") {
+			metrics.ConcurrencyConflictsTotal.WithLabelValues("idempotency_conflict").Inc()
 			h.respondError(w, http.StatusConflict, err.Error())
 			return
 		}
 		// Mapear erros de domínio para status HTTP adequados
 		if errors.Is(err, domain.ErrInsufficientFunds) || errors.Is(err, domain.ErrCurrencyMismatch) || errors.Is(err, domain.ErrZeroAmountRequired) {
+			metrics.TransactionsTotal.WithLabelValues("REJECTED", req.Kind, req.ProviderID).Inc()
 			h.respondError(w, http.StatusUnprocessableEntity, err.Error())
 			return
 		}
 		if errors.Is(err, repository.ErrOptimisticLockFailed) {
+			metrics.ConcurrencyConflictsTotal.WithLabelValues("optimistic_lock").Inc()
 			h.respondError(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -192,6 +211,7 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 	}
 
 	if result.IdempotentReplay {
+		metrics.DuplicatesTotal.WithLabelValues("http").Inc()
 		// Substitui a flag false para true no JSON de resposta
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -202,6 +222,8 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		json.NewEncoder(w).Encode(rawMap)
 		return
 	}
+
+	metrics.TransactionsTotal.WithLabelValues(string(result.Status), req.Kind, req.ProviderID).Inc()
 
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"transactionId":    result.TransactionID,
@@ -453,10 +475,82 @@ func (h *Handlers) HandleLiveness(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 }
 
+// HandleReadiness verifica conectividade real e ativa com PostgreSQL e SQS
 func (h *Handlers) HandleReadiness(w http.ResponseWriter, r *http.Request) {
-	// A validação profunda de readiness (ex: ping no BD) será integrada depois,
-	// por ora retornamos OK se o servidor HTTP está de pé.
-	h.respondJSON(w, http.StatusOK, map[string]string{"status": "READY"})
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	status := "READY"
+	httpStatus := http.StatusOK
+	components := map[string]string{
+		"database": "UP",
+		"sqs":      "UP",
+	}
+
+	if h.pool != nil {
+		if err := h.pool.Ping(ctx); err != nil {
+			components["database"] = "DOWN"
+			status = "DOWN"
+			httpStatus = http.StatusServiceUnavailable
+		}
+	}
+
+	if h.sqsClient != nil {
+		if _, err := h.sqsClient.ListQueues(ctx, &sqs.ListQueuesInput{MaxResults: aws.Int32(1)}); err != nil {
+			components["sqs"] = "DOWN"
+			status = "DOWN"
+			httpStatus = http.StatusServiceUnavailable
+		}
+	}
+
+	h.respondJSON(w, httpStatus, map[string]any{
+		"status":     status,
+		"database":   components["database"],
+		"sqs":        components["sqs"],
+		"components": components,
+	})
+}
+
+// HandleReconcileWallet — POST /wallets/{walletId}/reconciliation
+func (h *Handlers) HandleReconcileWallet(w http.ResponseWriter, r *http.Request) {
+	walletIDStr := r.PathValue("walletId")
+	walletID, err := uuid.Parse(walletIDStr)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid walletId format")
+		return
+	}
+
+	report, err := h.wagerService.ReconcileWallet(r.Context(), walletID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			h.respondError(w, http.StatusNotFound, "wallet not found")
+			return
+		}
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	if !report.Consistent {
+		metrics.ReconciliationDivergencesTotal.Inc()
+	}
+
+	h.respondJSON(w, http.StatusOK, map[string]any{
+		"walletId": report.WalletID.String(),
+		"storedBalance": map[string]string{
+			"amount":   report.StoredBalance.FormattedAmount(),
+			"currency": report.StoredBalance.Currency(),
+		},
+		"calculatedBalance": map[string]string{
+			"amount":   report.CalculatedBalance.FormattedAmount(),
+			"currency": report.CalculatedBalance.Currency(),
+		},
+		"difference": map[string]string{
+			"amount":   report.Difference.FormattedAmount(),
+			"currency": report.Difference.Currency(),
+		},
+		"consistent":     report.Consistent,
+		"checkedEntries": report.CheckedEntries,
+	})
 }
 
 func (h *Handlers) respondJSON(w http.ResponseWriter, status int, payload any) {
@@ -466,5 +560,20 @@ func (h *Handlers) respondJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func (h *Handlers) respondError(w http.ResponseWriter, status int, message string) {
-	h.respondJSON(w, status, map[string]string{"error": message})
+	code := "INTERNAL_ERROR"
+	switch status {
+	case http.StatusBadRequest:
+		code = "BAD_REQUEST"
+	case http.StatusNotFound:
+		code = "WALLET_NOT_FOUND"
+	case http.StatusForbidden:
+		code = "FORBIDDEN"
+	case http.StatusConflict:
+		code = "CONFLICT"
+	}
+	h.respondJSON(w, status, map[string]string{
+		"code":   code,
+		"error":  message,
+		"detail": message,
+	})
 }

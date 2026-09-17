@@ -6,15 +6,35 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/aws/aws-sdk-go-v2/service/sqs"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/moaaskt/jungle-test-challenge/pkg/auth"
 	"github.com/moaaskt/jungle-test-challenge/pkg/config"
+	"github.com/moaaskt/jungle-test-challenge/pkg/service"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/fx"
 )
 
 var Module = fx.Provide(
-	NewHandlers,
+	ProvideHandlers,
 	NewServer,
 )
+
+type ParamsHandlers struct {
+	fx.In
+
+	WagerService service.WagerService
+	Pool         *pgxpool.Pool `optional:"true"`
+	SQSClient    *sqs.Client   `optional:"true"`
+}
+
+func ProvideHandlers(p ParamsHandlers) *Handlers {
+	handlers := NewHandlers(p.WagerService)
+	if p.Pool != nil || p.SQSClient != nil {
+		handlers.WithHealthDependencies(p.Pool, p.SQSClient)
+	}
+	return handlers
+}
 
 func NewMux(handlers *Handlers) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -23,6 +43,7 @@ func NewMux(handlers *Handlers) *http.ServeMux {
 	mux.HandleFunc("POST /wallets", auth.RequireInternal(handlers.HandleOpenWallet))
 	mux.HandleFunc("GET /wallets/{walletId}", auth.RequireInternal(handlers.HandleGetWallet))
 	mux.HandleFunc("GET /wallets/{walletId}/ledger", auth.RequireInternal(handlers.HandleGetLedger))
+	mux.HandleFunc("POST /wallets/{walletId}/reconciliation", auth.RequireInternal(handlers.HandleReconcileWallet))
 
 	// Endpoints de Wagering (autenticados, com controle por provedor nos handlers)
 	mux.HandleFunc("POST /wagering/transactions", handlers.HandleWagerTransaction)
@@ -32,6 +53,9 @@ func NewMux(handlers *Handlers) *http.ServeMux {
 	// Endpoints de Saúde (Públicos)
 	mux.HandleFunc("GET /health/live", handlers.HandleLiveness)
 	mux.HandleFunc("GET /health/ready", handlers.HandleReadiness)
+
+	// Endpoint de Métricas Prometheus (Público)
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return mux
 }

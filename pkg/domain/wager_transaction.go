@@ -19,6 +19,7 @@ const (
 	FailureCodeAlreadyRolledBack         = "ALREADY_ROLLED_BACK"
 	FailureCodeOriginalTransactionFailed = "ORIGINAL_TRANSACTION_FAILED"
 	FailureCodeReferenceNotFound         = "REFERENCE_NOT_FOUND"
+	FailureCodeTransactionTimeout        = "TRANSACTION_TIMEOUT"
 )
 
 // ---------------------------------------------------------------------------

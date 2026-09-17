@@ -24,6 +24,7 @@ type WagerTransactionRepository interface {
 	GetPendingByExternalReference(ctx context.Context, tx pgx.Tx, providerID, externalRefID string) ([]*domain.WagerTransaction, error)
 	GetAllResolvable(ctx context.Context, tx pgx.Tx) ([]*PendingWithResolved, error)
 	HasProcessedReversal(ctx context.Context, tx pgx.Tx, referenceID uuid.UUID, txType domain.TransactionType) (bool, error)
+	GetStalePending(ctx context.Context, tx pgx.Tx, olderThan time.Duration, limit int) ([]*domain.WagerTransaction, error)
 }
 
 // PendingWithResolved agrupa uma transação PENDING_REFERENCE com a transação original
@@ -446,4 +447,23 @@ func (r *pgxWagerTransactionRepository) HasProcessedReversal(ctx context.Context
 		return false, err
 	}
 	return exists, nil
+}
+
+// GetStalePending busca transações que permaneceram em PENDING por mais tempo que o limiar (ex: 30s)
+// usando FOR UPDATE SKIP LOCKED para coordenação segura em instâncias múltiplas.
+func (r *pgxWagerTransactionRepository) GetStalePending(ctx context.Context, tx pgx.Tx, olderThan time.Duration, limit int) ([]*domain.WagerTransaction, error) {
+	threshold := time.Now().Add(-olderThan)
+	query := `SELECT ` + wagerTxSelectColumns + `
+		FROM wager_transactions
+		WHERE status = 'PENDING'
+		  AND updated_at <= $1
+		ORDER BY updated_at ASC
+		FOR UPDATE SKIP LOCKED
+		LIMIT $2
+	`
+	rows, err := tx.Query(ctx, query, threshold, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanWagerTransactions(rows)
 }

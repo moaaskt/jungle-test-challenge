@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
+	"github.com/moaaskt/jungle-test-challenge/pkg/metrics"
 	"github.com/moaaskt/jungle-test-challenge/pkg/money"
 	"github.com/moaaskt/jungle-test-challenge/pkg/service"
 )
@@ -313,12 +314,14 @@ func (c *SQSConsumer) processMessage(msg types.Message) {
 	res, err := c.wagerService.ProcessWagerWithInbox(ctx, req, inboxRecord)
 	if err != nil {
 		c.logger.Error("Transient error processing wager transaction with inbox, leaving in queue for retry", "messageId", msgID, "error", err)
+		metrics.SQSRetriesTotal.WithLabelValues(c.cfg.QueueURL).Inc()
 		return
 	}
 
 	// Ponto 1: Reentrega pós-commit (IdempotentReplay == true)
 	if res.IdempotentReplay {
 		c.logger.Info("Idempotent replay detected by inbox, immediately expunging duplicate message from SQS", "messageId", msgID)
+		metrics.DuplicatesTotal.WithLabelValues("sqs").Inc()
 		c.deleteFromQueue(receiptHandle)
 		return
 	}

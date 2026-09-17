@@ -51,6 +51,7 @@ func DecodeCursor(encoded string) (*LedgerCursor, error) {
 type LedgerRepository interface {
 	Insert(ctx context.Context, tx pgx.Tx, entry *domain.WalletLedgerEntry) error
 	GetByWalletID(ctx context.Context, tx pgx.Tx, walletID uuid.UUID, currency string, cursor *LedgerCursor, limit int) ([]*domain.WalletLedgerEntry, *LedgerCursor, error)
+	ReconstructBalance(ctx context.Context, tx pgx.Tx, walletID uuid.UUID) (calculatedBalance int64, checkedEntries int, err error)
 }
 
 type pgxLedgerRepository struct{}
@@ -156,3 +157,24 @@ func (r *pgxLedgerRepository) GetByWalletID(ctx context.Context, tx pgx.Tx, wall
 
 	return entries, nextCursor, nil
 }
+
+// ReconstructBalance calcula o saldo da carteira somando créditos e subtraindo débitos
+// diretamente a partir do histórico de lançamentos imutáveis do ledger.
+func (r *pgxLedgerRepository) ReconstructBalance(ctx context.Context, tx pgx.Tx, walletID uuid.UUID) (int64, int, error) {
+	query := `
+		SELECT 
+			COALESCE(SUM(CASE WHEN type = 'CREDIT' THEN amount ELSE 0 END), 0) -
+			COALESCE(SUM(CASE WHEN type = 'DEBIT' THEN amount ELSE 0 END), 0) AS calculated_balance,
+			COUNT(*) AS checked_entries
+		FROM wallet_ledger_entries
+		WHERE wallet_id = $1
+	`
+	var calculatedBalance int64
+	var checkedEntries int
+	err := tx.QueryRow(ctx, query, walletID).Scan(&calculatedBalance, &checkedEntries)
+	if err != nil {
+		return 0, 0, err
+	}
+	return calculatedBalance, checkedEntries, nil
+}
+
