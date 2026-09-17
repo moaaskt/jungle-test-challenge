@@ -1,6 +1,3 @@
-# Ignore planning
-.planning/
-
 # Binaries & build artifacts
 bin/
 
