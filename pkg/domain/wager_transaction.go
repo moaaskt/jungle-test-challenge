@@ -9,6 +9,19 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// Constantes de FailureCode estáveis e documentados (Seção 7 do desafio)
+// ---------------------------------------------------------------------------
+
+const (
+	FailureCodeInsufficientFunds         = "INSUFFICIENT_FUNDS"
+	FailureCodeInsufficientFundsRollback = "INSUFFICIENT_FUNDS_FOR_ROLLBACK"
+	FailureCodeAlreadyRefunded           = "ALREADY_REFUNDED"
+	FailureCodeAlreadyRolledBack         = "ALREADY_ROLLED_BACK"
+	FailureCodeOriginalTransactionFailed = "ORIGINAL_TRANSACTION_FAILED"
+	FailureCodeReferenceNotFound         = "REFERENCE_NOT_FOUND"
+)
+
+// ---------------------------------------------------------------------------
 // Tipos enumerados
 // ---------------------------------------------------------------------------
 
@@ -119,6 +132,10 @@ type WagerTransaction struct {
 
 	// Código de falha (preenchido quando status == FAILED ou REJECTED)
 	FailureCode *string
+
+	// Rastreamento de tentativas do worker de resolução de referências pendentes
+	Attempts     int
+	NextAttemptAt *time.Time
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -245,6 +262,8 @@ func RehydrateWagerTransaction(
 	currency string,
 	status TransactionStatus,
 	failureCode *string,
+	attempts int,
+	nextAttemptAt *time.Time,
 	createdAt, updatedAt time.Time,
 ) WagerTransaction {
 	return WagerTransaction{
@@ -266,6 +285,8 @@ func RehydrateWagerTransaction(
 		Currency:                       currency,
 		Status:                         status,
 		FailureCode:                    failureCode,
+		Attempts:                       attempts,
+		NextAttemptAt:                  nextAttemptAt,
 		CreatedAt:                      createdAt,
 		UpdatedAt:                      updatedAt,
 	}
@@ -364,4 +385,24 @@ func (tx *WagerTransaction) IsLoss() bool {
 // a outra transação (REFUND e ROLLBACK).
 func (tx *WagerTransaction) RequiresReference() bool {
 	return tx.Type == TransactionTypeRefund || tx.Type == TransactionTypeRollback
+}
+
+// ResolutionDirection retorna "CREDIT" ou "DEBIT" para a resolução de uma PENDING_REFERENCE
+// com base no tipo da transação original referenciada.
+//
+// Regras (Seção 7 do desafio):
+//   - REFUND de BET → CREDIT (devolve o débito da aposta)
+//   - ROLLBACK de BET → CREDIT (desfaz o débito da aposta)
+//   - ROLLBACK de WIN → DEBIT (desfaz o crédito do ganho)
+//   - ROLLBACK de REFUND → DEBIT (desfaz o crédito do reembolso)
+func (tx *WagerTransaction) ResolutionDirection(originalType TransactionType) string {
+	switch {
+	case tx.Type == TransactionTypeRefund:
+		return "CREDIT"
+	case tx.Type == TransactionTypeRollback && originalType == TransactionTypeBet:
+		return "CREDIT"
+	default:
+		// ROLLBACK de WIN, REFUND, ou outros → DEBIT (desfaz crédito)
+		return "DEBIT"
+	}
 }

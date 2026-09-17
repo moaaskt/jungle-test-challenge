@@ -32,4 +32,20 @@ var (
 
 	// ErrExternalIDRequired é retornado quando origin é EXTERNAL mas external_id está ausente.
 	ErrExternalIDRequired = errors.New("external transactions require an external_id")
+
+	// ErrInsufficientFundsForRollback é retornado quando um ROLLBACK de WIN precisaria
+	// debitar mais do que o saldo disponível. Código diferenciado de ErrInsufficientFunds.
+	ErrInsufficientFundsForRollback = errors.New("insufficient funds for rollback: debit would result in negative balance")
+
+	// ErrAlreadyRefunded é retornado quando já existe um REFUND processado para a referência.
+	ErrAlreadyRefunded = errors.New("transaction has already been refunded")
+
+	// ErrAlreadyRolledBack é retornado quando já existe um ROLLBACK processado para a referência.
+	ErrAlreadyRolledBack = errors.New("transaction has already been rolled back")
+
+	// ErrOriginalTransactionFailed é retornado quando a transação referenciada está em REJECTED ou FAILED.
+	ErrOriginalTransactionFailed = errors.New("original transaction is rejected or failed")
+
+	// ErrReferenceNotFound é retornado quando o TTL ou máximo de tentativas expiram sem a referência aparecer.
+	ErrReferenceNotFound = errors.New("reference transaction not found within TTL")
 )

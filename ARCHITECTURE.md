@@ -127,4 +127,54 @@ O serviço integra com a infraestrutura AWS SQS (LocalStack local e AWS em produ
 - Se o prazo limite for atingido com mensagens ainda não comitadas, o consumidor aciona `sqs.ChangeMessageVisibility` com `VisibilityTimeout: 0` para cada mensagem pendente em voo.
 - As mensagens são imediatamente liberadas de volta ao broker para redistribuição instantânea por outros pods/instâncias, sem reter os 30 segundos do visibility timeout padrão. Caso a goroutine retardada termine após a liberação, ela ignora a deleção (`Skipping delete for message whose visibility was released to 0s`), preservando a integridade da fila.
 
+---
+
+## 8. Resolução de Referências Pendentes e Endpoints de Consulta (Seções 7 e 9 do Desafio)
+
+### 8.1. Padrão de Resolução em Dois Momentos (Dual-Moment Resolution)
+Em conformidade com as Seções 6.3, 6.5 e 7 do desafio, transações de `REFUND` e `ROLLBACK` podem chegar fora de ordem (antes da aposta original). O sistema emprega um padrão de resolução em dois momentos para garantir latência mínima e conciliação eventual infalível:
+
+1. **Momento A (Resolução Inline Reativa)**:
+   - Ao processar uma transação original (`BET`/`WIN`) via SQS ou HTTP, imediatamente após persistir a transação principal, o `WagerService` busca transações em `PENDING_REFERENCE` que apontem para aquele `(provider_id, external_id)` utilizando o índice parcial `idx_wager_tx_pending_ref`.
+   - Se encontradas, a resolução é executada **dentro da mesma transação SQL (`pgx.Tx`)** do evento principal. O saldo da carteira é ajustado, o ledger append-only é gravado, a transação pendente transiciona para `PROCESSED` e os eventos de outbox correspondentes (`WagerTransactionProcessed`, `WalletBalanceChanged`) são gerados atomicamente.
+   - **Garantia de latência zero**: Não depende de espera do worker de reconciliação em lote.
+
+2. **Momento B (Worker Periódico de Reconciliação — `PendingRefResolver`)**:
+   - Um worker em background varre periodicamente (default: a cada 10s) a tabela `wager_transactions` buscando registros `PENDING_REFERENCE` elegíveis para retry (`next_attempt_at <= NOW()`).
+   - Através de uma query com `LEFT JOIN`, o worker verifica se o `BET`/`WIN` original já foi processado ou se a pendência atingiu o limite de expiração (TTL de 60 minutos ou 10 tentativas).
+   - Utiliza `FOR UPDATE SKIP LOCKED` para permitir execução concorrente e coordenada entre múltiplas réplicas da aplicação sem bloqueios mútuos e sem risco de deadlocks (`40P01`).
+
+### 8.2. Matriz de Direção Financeira e Guardas de Negócio
+A reconciliação financeira de referências pendentes obedece à semântica estrita do desafio:
+
+| Transação Pendente | Transação Original Referenciada | Direção Financeira | Validações e Códigos de Erro Estáveis |
+|---|---|---|---|
+| `REFUND` | `BET` (PROCESSED) | **CREDIT** (Crédito) | Se já reembolsado anteriormente → `ALREADY_REFUNDED`. Se BET original falhou (`REJECTED`/`FAILED`) → `ORIGINAL_TRANSACTION_FAILED`. |
+| `ROLLBACK` | `BET` (PROCESSED) | **CREDIT** (Crédito) | Devolve o valor apostado. Se já revertido → `ALREADY_ROLLED_BACK`. Se BET falhou → `ORIGINAL_TRANSACTION_FAILED`. |
+| `ROLLBACK` | `WIN` (PROCESSED) | **DEBIT** (Débito) | Estorna prêmio pago indevidamente. Valida saldo disponível: se insuficiente → `INSUFFICIENT_FUNDS_FOR_ROLLBACK`. Se já revertido → `ALREADY_ROLLED_BACK`. |
+| `REFUND` / `ROLLBACK` | Não encontrada (TTL > 60m ou > 10 tentativas) | **NENHUMA** | Transiciona para `REJECTED` com `failureCode: REFERENCE_NOT_FOUND` e emite `WagerTransactionRejected` na Outbox. |
+
+### 8.3. Backoff Exponencial e Fim de Vida do Limbo (TTL)
+Para garantir que nenhuma mensagem permaneça indefinidamente em `PENDING_REFERENCE`:
+- **Backoff Exponencial**: A cada rodada sem a chegada da transação referenciada, o worker incrementa `attempts` e agenda `next_attempt_at = NOW() + min(2^attempts, 300s)`.
+- **Expiração por TTL**: Ao ultrapassar 60 minutos desde a criação (`created_at <= NOW() - 60 minutes`) ou 10 tentativas, a pendência é formalmente rejeitada como falha definitiva (`REFERENCE_NOT_FOUND`), liberando recursos e emitindo evento outbox para conhecimento externo.
+
+### 8.4. Endpoints de Consulta HTTP (Seção 9 do Edital Oficial)
+Para auditoria e integração dos operadores, o sistema provê endpoints de leitura otimizados:
+
+1. **`GET /wallets/{walletId}`**:
+   - Retorna o saldo corrente da carteira, moeda, jogador e a versão atual de concorrência (`version`). Retorna `404 Not Found` se não existir.
+
+2. **`GET /wallets/{walletId}/ledger?limit=20&cursor=...` (Paginação Keyset com Cursor Opaco)**:
+   - Paginação baseada em chaves (`(created_at, id)`) que elimina problemas de performance e inconsistência de `OFFSET`.
+   - O cursor é serializado em Base64 opaco (`EncodeCursor` / `DecodeCursor`).
+   - Retorna `entries` ordenadas decrescentemente por data/ID e `nextCursor` (string ou `null` quando for a última página). Parâmetro `limit` com padrão 20 e teto de 100 itens. Retorna `400 Bad Request` para cursor inválido ou corrompido.
+
+3. **`GET /wagering/transactions/{transactionId}`**:
+   - Consulta pelo UUID interno da transação. Retorna o snapshot completo incluindo `status`, `amount`, `origin`, `referenceId`, `externalTransactionId` e `failureCode` (se rejeitada).
+
+4. **`GET /providers/{providerId}/wagering/transactions/{externalTransactionId}`**:
+   - Rota hierárquica estritamente em conformidade com o edital da Seção 9 (sem query params), suportada nativamente pelo multiplexador HTTP do Go 1.22+.
+
+
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/moaaskt/jungle-test-challenge/pkg/api"
@@ -19,6 +20,7 @@ func main() {
 
 	app := fx.New(
 		fx.Supply(cfg),
+		fx.Provide(slog.Default),
 		database.Module,
 		repository.Module,
 		messaging.Module,

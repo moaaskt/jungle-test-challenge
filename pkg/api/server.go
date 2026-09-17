@@ -15,7 +15,7 @@ var Module = fx.Provide(
 	NewServer,
 )
 
-func NewServer(lc fx.Lifecycle, cfg *config.Config, handlers *Handlers) *http.Server {
+func NewMux(handlers *Handlers) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Endpoints exigidos pelo desafio
@@ -23,6 +23,18 @@ func NewServer(lc fx.Lifecycle, cfg *config.Config, handlers *Handlers) *http.Se
 	mux.HandleFunc("POST /wagering/transactions", handlers.HandleWagerTransaction)
 	mux.HandleFunc("GET /health/live", handlers.HandleLiveness)
 	mux.HandleFunc("GET /health/ready", handlers.HandleReadiness)
+
+	// Endpoints de Consulta (Seção 9 do desafio)
+	mux.HandleFunc("GET /wallets/{walletId}", handlers.HandleGetWallet)
+	mux.HandleFunc("GET /wallets/{walletId}/ledger", handlers.HandleGetLedger)
+	mux.HandleFunc("GET /wagering/transactions/{transactionId}", handlers.HandleGetTransaction)
+	mux.HandleFunc("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", handlers.HandleGetTransactionByExternal)
+
+	return mux
+}
+
+func NewServer(lc fx.Lifecycle, cfg *config.Config, handlers *Handlers) *http.Server {
+	mux := NewMux(handlers)
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.Port),

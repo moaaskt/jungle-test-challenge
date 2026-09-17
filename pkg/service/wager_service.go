@@ -19,6 +19,10 @@ type WagerService interface {
 	OpenWallet(ctx context.Context, playerID, currency string, initialBalance int64) (*domain.Wallet, error)
 	ProcessWager(ctx context.Context, req ProcessWagerRequest) (ProcessWagerResult, error)
 	ProcessWagerWithInbox(ctx context.Context, req ProcessWagerRequest, inbox domain.InboxRecord) (ProcessWagerResult, error)
+	GetWallet(ctx context.Context, walletID uuid.UUID) (*domain.Wallet, error)
+	GetTransaction(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error)
+	GetTransactionByExternal(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error)
+	GetLedger(ctx context.Context, walletID uuid.UUID, currency string, cursor *repository.LedgerCursor, limit int) ([]*domain.WalletLedgerEntry, *repository.LedgerCursor, error)
 }
 
 type ProcessWagerResult struct {
@@ -756,6 +760,17 @@ func (s *wagerService) processWagerWithInboxInternal(ctx context.Context, req Pr
 		}
 	}
 
+	// -----------------------------------------------------------------------
+	// Resolução inline de referências pendentes (Seção 6.5 — Momento A)
+	// Se esta transação recém processada é referência de algum REFUND/ROLLBACK
+	// que chegou antes (PENDING_REFERENCE), resolvemos atomicamente aqui.
+	// -----------------------------------------------------------------------
+	if req.ExternalID != nil && req.ProviderID != nil {
+		if err := s.resolvePendingRefs(ctx, tx, w, &wagerTx, correlationID, causationID); err != nil {
+			return ProcessWagerResult{}, fmt.Errorf("failed to resolve pending refs inline: %w", err)
+		}
+	}
+
 	// 9. Gravar Idempotência de negócio
 	if idemKey != "" {
 		responseMap := map[string]any{
@@ -796,5 +811,245 @@ func safeDeref(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// ---------------------------------------------------------------------------
+// Resolução de Referências Pendentes (Seção 6.5 / 7 do desafio)
+// ---------------------------------------------------------------------------
+
+// resolvePendingRefs busca e resolve todas as transações PENDING_REFERENCE que
+// referenciam a transação original recém-processada. Usado no Momento A (inline).
+func (s *wagerService) resolvePendingRefs(
+	ctx context.Context, tx pgx.Tx,
+	w *domain.Wallet, originalTx *domain.WagerTransaction,
+	correlationID string, causationID *string,
+) error {
+	providerID := safeDeref(originalTx.ProviderID)
+	externalID := safeDeref(originalTx.ExternalID)
+	if providerID == "" || externalID == "" {
+		return nil
+	}
+
+	pendingRefs, err := s.wagerRepo.GetPendingByExternalReference(ctx, tx, providerID, externalID)
+	if err != nil {
+		return fmt.Errorf("failed to query pending references: %w", err)
+	}
+
+	for _, pendingTx := range pendingRefs {
+		if err := s.resolveSinglePendingRef(ctx, tx, w, pendingTx, originalTx, correlationID, causationID); err != nil {
+			return fmt.Errorf("failed to resolve pending reference %s: %w", pendingTx.ID, err)
+		}
+	}
+	return nil
+}
+
+// resolveSinglePendingRef resolve uma única transação PENDING_REFERENCE.
+// Aplica todas as regras da Seção 7 do desafio:
+//   1. Guarda contra dupla reversão (ALREADY_REFUNDED / ALREADY_ROLLED_BACK)
+//   2. Referência original em REJECTED/FAILED → rejeitar com ORIGINAL_TRANSACTION_FAILED
+//   3. Direção correta: ROLLBACK de WIN é DEBIT (verifica saldo)
+//   4. Saldo insuficiente para rollback → INSUFFICIENT_FUNDS_FOR_ROLLBACK
+func (s *wagerService) resolveSinglePendingRef(
+	ctx context.Context, tx pgx.Tx,
+	w *domain.Wallet,
+	pendingTx *domain.WagerTransaction,
+	originalTx *domain.WagerTransaction,
+	correlationID string, causationID *string,
+) error {
+	// 1. Se originalTx é nil, é TTL expirado — rejeitar com REFERENCE_NOT_FOUND
+	if originalTx == nil {
+		pendingTx.Reject(domain.FailureCodeReferenceNotFound)
+		if err := s.wagerRepo.Update(ctx, tx, pendingTx); err != nil {
+			return fmt.Errorf("failed to update expired pending ref: %w", err)
+		}
+		evRejected, err := domain.NewWagerTransactionRejectedOutboxEvent(pendingTx, correlationID, causationID)
+		if err != nil {
+			return fmt.Errorf("failed to create rejected outbox event for expired ref: %w", err)
+		}
+		return s.outboxRepo.Insert(ctx, tx, evRejected)
+	}
+
+	// 2. Referência original em REJECTED ou FAILED → rejeitar
+	if originalTx.Status == domain.StatusRejected || originalTx.Status == domain.StatusFailed {
+		pendingTx.Reject(domain.FailureCodeOriginalTransactionFailed)
+		if err := s.wagerRepo.Update(ctx, tx, pendingTx); err != nil {
+			return fmt.Errorf("failed to update pending ref with failed original: %w", err)
+		}
+		evRejected, err := domain.NewWagerTransactionRejectedOutboxEvent(pendingTx, correlationID, causationID)
+		if err != nil {
+			return fmt.Errorf("failed to create rejected outbox event: %w", err)
+		}
+		return s.outboxRepo.Insert(ctx, tx, evRejected)
+	}
+
+	// 3. Guarda contra dupla reversão
+	alreadyReversed, err := s.wagerRepo.HasProcessedReversal(ctx, tx, originalTx.ID, pendingTx.Type)
+	if err != nil {
+		return fmt.Errorf("failed to check processed reversal: %w", err)
+	}
+	if alreadyReversed {
+		failureCode := domain.FailureCodeAlreadyRefunded
+		if pendingTx.Type == domain.TransactionTypeRollback {
+			failureCode = domain.FailureCodeAlreadyRolledBack
+		}
+		pendingTx.Reject(failureCode)
+		if err := s.wagerRepo.Update(ctx, tx, pendingTx); err != nil {
+			return fmt.Errorf("failed to update duplicate reversal: %w", err)
+		}
+		evRejected, err := domain.NewWagerTransactionRejectedOutboxEvent(pendingTx, correlationID, causationID)
+		if err != nil {
+			return fmt.Errorf("failed to create rejected outbox event for duplicate reversal: %w", err)
+		}
+		return s.outboxRepo.Insert(ctx, tx, evRejected)
+	}
+
+	// 4. Determinar direção financeira do movimento
+	direction := pendingTx.ResolutionDirection(originalTx.Type)
+	balanceBefore := w.Balance()
+
+	var entry domain.WalletLedgerEntry
+	var opErr error
+
+	switch direction {
+	case "CREDIT":
+		entry, opErr = w.Credit(pendingTx.Amount, pendingTx.ID)
+	case "DEBIT":
+		entry, opErr = w.Debit(pendingTx.Amount, pendingTx.ID)
+		if errors.Is(opErr, domain.ErrInsufficientFunds) {
+			// Código diferenciado para rollback sem saldo (Seção 7)
+			pendingTx.Reject(domain.FailureCodeInsufficientFundsRollback)
+			if err := s.wagerRepo.Update(ctx, tx, pendingTx); err != nil {
+				return fmt.Errorf("failed to update rollback with insufficient funds: %w", err)
+			}
+			evRejected, err := domain.NewWagerTransactionRejectedOutboxEvent(pendingTx, correlationID, causationID)
+			if err != nil {
+				return fmt.Errorf("failed to create rejected outbox event for insufficient rollback: %w", err)
+			}
+			return s.outboxRepo.Insert(ctx, tx, evRejected)
+		}
+	}
+	if opErr != nil {
+		return fmt.Errorf("failed to apply %s for pending ref: %w", direction, opErr)
+	}
+
+	// 5. Resolução bem-sucedida
+	if err := pendingTx.ResolveAndProcess(originalTx.ID); err != nil {
+		return fmt.Errorf("failed to resolve and process pending ref: %w", err)
+	}
+
+	if err := s.walletRepo.UpdateBalance(ctx, tx, w); err != nil {
+		return fmt.Errorf("failed to update wallet balance after resolution: %w", err)
+	}
+	if err := s.wagerRepo.Update(ctx, tx, pendingTx); err != nil {
+		return fmt.Errorf("failed to update resolved pending ref: %w", err)
+	}
+	if err := s.ledgerRepo.Insert(ctx, tx, &entry); err != nil {
+		return fmt.Errorf("failed to insert ledger entry for resolved ref: %w", err)
+	}
+
+	// Emitir eventos de Outbox
+	evProcessed, err := domain.NewWagerTransactionProcessedOutboxEvent(pendingTx, correlationID, causationID)
+	if err != nil {
+		return fmt.Errorf("failed to create processed outbox event for resolved ref: %w", err)
+	}
+	if err := s.outboxRepo.Insert(ctx, tx, evProcessed); err != nil {
+		return fmt.Errorf("failed to insert processed outbox event for resolved ref: %w", err)
+	}
+
+	evBalance, err := domain.NewWalletBalanceChangedOutboxEvent(
+		w.ID,
+		pendingTx.ID,
+		direction,
+		pendingTx.Amount,
+		balanceBefore,
+		w.Balance(),
+		w.Version,
+		correlationID,
+		causationID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create balance changed outbox event for resolved ref: %w", err)
+	}
+	if err := s.outboxRepo.Insert(ctx, tx, evBalance); err != nil {
+		return fmt.Errorf("failed to insert balance changed outbox event for resolved ref: %w", err)
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Métodos de Consulta (Seção 9 do desafio)
+// ---------------------------------------------------------------------------
+
+func (s *wagerService) GetWallet(ctx context.Context, walletID uuid.UUID) (*domain.Wallet, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin read-only transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	w, err := s.walletRepo.GetByID(ctx, tx, walletID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit read-only transaction: %w", err)
+	}
+	return w, nil
+}
+
+func (s *wagerService) GetTransaction(ctx context.Context, id uuid.UUID) (*domain.WagerTransaction, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin read-only transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	wt, err := s.wagerRepo.GetByID(ctx, tx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit read-only transaction: %w", err)
+	}
+	return wt, nil
+}
+
+func (s *wagerService) GetTransactionByExternal(ctx context.Context, providerID, externalID string) (*domain.WagerTransaction, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin read-only transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	wt, err := s.wagerRepo.GetByProviderAndExternalID(ctx, tx, providerID, externalID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit read-only transaction: %w", err)
+	}
+	return wt, nil
+}
+
+func (s *wagerService) GetLedger(ctx context.Context, walletID uuid.UUID, currency string, cursor *repository.LedgerCursor, limit int) ([]*domain.WalletLedgerEntry, *repository.LedgerCursor, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to begin read-only transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	entries, nextCursor, err := s.ledgerRepo.GetByWalletID(ctx, tx, walletID, currency, cursor, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, fmt.Errorf("failed to commit read-only transaction: %w", err)
+	}
+	return entries, nextCursor, nil
 }
 

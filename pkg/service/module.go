@@ -14,8 +14,11 @@ var Module = fx.Options(
 			return &cfg
 		},
 		NewOutboxRelayer,
+		DefaultPendingRefResolverConfig,
+		NewPendingRefResolver,
 	),
 	fx.Invoke(registerOutboxRelayerLifecycle),
+	fx.Invoke(registerPendingRefResolverLifecycle),
 )
 
 func registerOutboxRelayerLifecycle(lc fx.Lifecycle, relayer *OutboxRelayer) {
@@ -26,6 +29,19 @@ func registerOutboxRelayerLifecycle(lc fx.Lifecycle, relayer *OutboxRelayer) {
 		},
 		OnStop: func(ctx context.Context) error {
 			return relayer.Stop(ctx)
+		},
+	})
+}
+
+func registerPendingRefResolverLifecycle(lc fx.Lifecycle, resolver *PendingRefResolver) {
+	lc.Append(fx.Hook{
+		OnStart: func(ctx context.Context) error {
+			resolver.Start(context.Background())
+			return nil
+		},
+		OnStop: func(ctx context.Context) error {
+			resolver.Stop()
+			return nil
 		},
 	})
 }

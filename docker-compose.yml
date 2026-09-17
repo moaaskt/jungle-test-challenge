@@ -13,6 +13,7 @@ services:
       - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql
       - ./migrations/000002_add_outbox_leasing.up.sql:/docker-entrypoint-initdb.d/02_outbox.sql
       - ./migrations/000003_add_inbox_metadata.up.sql:/docker-entrypoint-initdb.d/03_inbox.sql
+      - ./migrations/000004_add_pending_ref_worker.up.sql:/docker-entrypoint-initdb.d/04_pending_ref.sql
 
   localstack:
     image: localstack/localstack:3.8
