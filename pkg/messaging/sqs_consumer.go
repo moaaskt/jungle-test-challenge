@@ -20,24 +20,24 @@ import (
 
 // WagerMessageEnvelope representa o envelope padrão das mensagens recebidas pelo SQS (Seção 10 da spec).
 type WagerMessageEnvelope struct {
-	MessageID   string           `json:"messageId"`
-	Type        string           `json:"type"`
-	OccurredAt  string           `json:"occurredAt"`
-	Data        WagerMessageData `json:"data"`
+	MessageID  string           `json:"messageId"`
+	Type       string           `json:"type"`
+	OccurredAt string           `json:"occurredAt"`
+	Data       WagerMessageData `json:"data"`
 }
 
 // WagerMessageData contém o payload de WagerTransactionRequested.
 type WagerMessageData struct {
-	ProviderID                     string      `json:"providerId"`
-	ExternalTransactionID          string      `json:"externalTransactionId"`
-	IdempotencyKey                 string      `json:"idempotencyKey"`
-	PlayerID                       string      `json:"playerId"`
-	WalletID                       string      `json:"walletId"`
-	RoundID                        string      `json:"roundId"`
-	GameID                         string      `json:"gameId"`
-	Kind                           string      `json:"kind"` // BET, WIN, LOSS, REFUND, ROLLBACK
+	ProviderID                     string       `json:"providerId"`
+	ExternalTransactionID          string       `json:"externalTransactionId"`
+	IdempotencyKey                 string       `json:"idempotencyKey"`
+	PlayerID                       string       `json:"playerId"`
+	WalletID                       string       `json:"walletId"`
+	RoundID                        string       `json:"roundId"`
+	GameID                         string       `json:"gameId"`
+	Kind                           string       `json:"kind"` // BET, WIN, LOSS, REFUND, ROLLBACK
 	Money                          moneyPayload `json:"money"`
-	ReferenceExternalTransactionID string      `json:"referenceExternalTransactionId,omitempty"`
+	ReferenceExternalTransactionID string       `json:"referenceExternalTransactionId,omitempty"`
 }
 
 type moneyPayload struct {

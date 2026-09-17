@@ -29,11 +29,11 @@ type WagerRequest struct {
 }
 
 type WorkerOutput struct {
-	StatusCode       int            `json:"statusCode"`
-	Body             map[string]any `json:"body,omitempty"`
-	RawBody          string         `json:"rawBody,omitempty"`
-	Error            string         `json:"error,omitempty"`
-	DurationMillis   int64          `json:"durationMillis"`
+	StatusCode     int            `json:"statusCode"`
+	Body           map[string]any `json:"body,omitempty"`
+	RawBody        string         `json:"rawBody,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	DurationMillis int64          `json:"durationMillis"`
 }
 
 func main() {

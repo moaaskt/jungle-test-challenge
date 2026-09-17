@@ -88,4 +88,3 @@ func init() {
 	ConcurrencyConflictsTotal.WithLabelValues("optimistic_lock")
 	ProcessingDuration.WithLabelValues("BET")
 }
-

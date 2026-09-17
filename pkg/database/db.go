@@ -6,8 +6,8 @@ import (
 	"log"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"go.uber.org/fx"
 	"github.com/moaaskt/jungle-test-challenge/pkg/config"
+	"go.uber.org/fx"
 )
 
 // Module expõe os construtores deste pacote para o Fx.

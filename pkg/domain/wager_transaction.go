@@ -135,7 +135,7 @@ type WagerTransaction struct {
 	FailureCode *string
 
 	// Rastreamento de tentativas do worker de resolução de referências pendentes
-	Attempts     int
+	Attempts      int
 	NextAttemptAt *time.Time
 
 	CreatedAt time.Time

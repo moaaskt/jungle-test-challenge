@@ -224,7 +224,6 @@ func (r *pgxWagerTransactionRepository) GetByIdempotencyKey(ctx context.Context,
 	return scanWagerTransaction(row)
 }
 
-
 // Update persiste campos mutáveis de uma WagerTransaction após resolução.
 func (r *pgxWagerTransactionRepository) Update(ctx context.Context, tx pgx.Tx, wt *domain.WagerTransaction) error {
 	query := `
@@ -311,34 +310,34 @@ func (r *pgxWagerTransactionRepository) GetAllResolvable(ctx context.Context, tx
 	for rows.Next() {
 		var (
 			// pending fields
-			pID, pWalletID                   uuid.UUID
-			pOrigin, pTxType, pStatus        string
-			pCurrency, pPlayerID             string
-			pExternalID, pProviderID         *string
-			pIdemKey, pPayloadHash           *string
-			pRoundID, pGameID                *string
-			pRefID                           *uuid.UUID
-			pRefExtID                        *string
-			pErrCode                         *string
-			pAttempts                        int
-			pNextAttemptAt                   *time.Time
-			pAmount                          int64
-			pCreatedAt, pUpdatedAt           time.Time
+			pID, pWalletID            uuid.UUID
+			pOrigin, pTxType, pStatus string
+			pCurrency, pPlayerID      string
+			pExternalID, pProviderID  *string
+			pIdemKey, pPayloadHash    *string
+			pRoundID, pGameID         *string
+			pRefID                    *uuid.UUID
+			pRefExtID                 *string
+			pErrCode                  *string
+			pAttempts                 int
+			pNextAttemptAt            *time.Time
+			pAmount                   int64
+			pCreatedAt, pUpdatedAt    time.Time
 
 			// resolved fields
-			rID, rWalletID                   uuid.UUID
-			rOrigin, rTxType, rStatus        string
-			rCurrency, rPlayerID             string
-			rExternalID, rProviderID         *string
-			rIdemKey, rPayloadHash           *string
-			rRoundID, rGameID                *string
-			rRefID                           *uuid.UUID
-			rRefExtID                        *string
-			rErrCode                         *string
-			rAttempts                        int
-			rNextAttemptAt                   *time.Time
-			rAmount                          int64
-			rCreatedAt, rUpdatedAt           time.Time
+			rID, rWalletID            uuid.UUID
+			rOrigin, rTxType, rStatus string
+			rCurrency, rPlayerID      string
+			rExternalID, rProviderID  *string
+			rIdemKey, rPayloadHash    *string
+			rRoundID, rGameID         *string
+			rRefID                    *uuid.UUID
+			rRefExtID                 *string
+			rErrCode                  *string
+			rAttempts                 int
+			rNextAttemptAt            *time.Time
+			rAmount                   int64
+			rCreatedAt, rUpdatedAt    time.Time
 		)
 
 		err := rows.Scan(

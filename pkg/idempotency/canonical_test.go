@@ -23,7 +23,7 @@ func TestHashPayload_Deterministic(t *testing.T) {
 		WalletID:              "wallet-abc",
 		ProviderID:            "provider-a",
 		PlayerID:              "player-456",
-		Money: MoneyPayload{Currency: "BRL", Amount: "25.00"},
+		Money:                 MoneyPayload{Currency: "BRL", Amount: "25.00"},
 		Kind:                  "BET",
 		GameID:                "fortune-chimp",
 		ExternalTransactionID: "txn-123",

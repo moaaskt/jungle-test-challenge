@@ -868,10 +868,10 @@ func (s *wagerService) resolvePendingRefs(
 
 // resolveSinglePendingRef resolve uma única transação PENDING_REFERENCE.
 // Aplica todas as regras da Seção 7 do desafio:
-//   1. Guarda contra dupla reversão (ALREADY_REFUNDED / ALREADY_ROLLED_BACK)
-//   2. Referência original em REJECTED/FAILED → rejeitar com ORIGINAL_TRANSACTION_FAILED
-//   3. Direção correta: ROLLBACK de WIN é DEBIT (verifica saldo)
-//   4. Saldo insuficiente para rollback → INSUFFICIENT_FUNDS_FOR_ROLLBACK
+//  1. Guarda contra dupla reversão (ALREADY_REFUNDED / ALREADY_ROLLED_BACK)
+//  2. Referência original em REJECTED/FAILED → rejeitar com ORIGINAL_TRANSACTION_FAILED
+//  3. Direção correta: ROLLBACK de WIN é DEBIT (verifica saldo)
+//  4. Saldo insuficiente para rollback → INSUFFICIENT_FUNDS_FOR_ROLLBACK
 func (s *wagerService) resolveSinglePendingRef(
 	ctx context.Context, tx pgx.Tx,
 	w *domain.Wallet,
@@ -1141,5 +1141,3 @@ func (s *wagerService) ReconcileWallet(ctx context.Context, walletID uuid.UUID) 
 		CheckedEntries:    checkedEntries,
 	}, nil
 }
-
-

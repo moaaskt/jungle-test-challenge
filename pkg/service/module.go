@@ -61,4 +61,3 @@ func registerStaleTxRecoveryWorkerLifecycle(lc fx.Lifecycle, worker *StaleTxReco
 		},
 	})
 }
-

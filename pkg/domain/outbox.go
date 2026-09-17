@@ -101,16 +101,16 @@ type WalletBalanceChangedData struct {
 
 // WagerTransactionPendingReferenceData é o payload do evento WagerTransactionPendingReference.
 type WagerTransactionPendingReferenceData struct {
-	TransactionID                   uuid.UUID `json:"transactionId"`
-	WalletID                        uuid.UUID `json:"walletId"`
-	PlayerID                        string    `json:"playerId"`
-	ProviderID                      *string   `json:"providerId,omitempty"`
-	ExternalID                      *string   `json:"externalId,omitempty"`
+	TransactionID                  uuid.UUID `json:"transactionId"`
+	WalletID                       uuid.UUID `json:"walletId"`
+	PlayerID                       string    `json:"playerId"`
+	ProviderID                     *string   `json:"providerId,omitempty"`
+	ExternalID                     *string   `json:"externalId,omitempty"`
 	ReferenceExternalTransactionID *string   `json:"referenceExternalTransactionId,omitempty"`
-	Type                            string    `json:"type"`
-	Amount                          string    `json:"amount"`
-	Currency                        string    `json:"currency"`
-	Status                          string    `json:"status"`
+	Type                           string    `json:"type"`
+	Amount                         string    `json:"amount"`
+	Currency                       string    `json:"currency"`
+	Status                         string    `json:"status"`
 }
 
 // NewWagerTransactionProcessedOutboxEvent cria um evento de outbox para WagerTransactionProcessed.
@@ -319,16 +319,16 @@ func NewWagerTransactionPendingReferenceOutboxEvent(
 	occurredAtStr := occurredAt.Format(time.RFC3339Nano)
 
 	data := WagerTransactionPendingReferenceData{
-		TransactionID:                   tx.ID,
-		WalletID:                        tx.WalletID,
-		PlayerID:                        tx.PlayerID,
-		ProviderID:                      tx.ProviderID,
-		ExternalID:                      tx.ExternalID,
+		TransactionID:                  tx.ID,
+		WalletID:                       tx.WalletID,
+		PlayerID:                       tx.PlayerID,
+		ProviderID:                     tx.ProviderID,
+		ExternalID:                     tx.ExternalID,
 		ReferenceExternalTransactionID: tx.ReferenceExternalTransactionID,
-		Type:                            string(tx.Type),
-		Amount:                          tx.Amount.FormattedAmount(),
-		Currency:                        tx.Currency,
-		Status:                          string(tx.Status),
+		Type:                           string(tx.Type),
+		Amount:                         tx.Amount.FormattedAmount(),
+		Currency:                       tx.Currency,
+		Status:                         string(tx.Status),
 	}
 
 	dataBytes, err := json.Marshal(data)

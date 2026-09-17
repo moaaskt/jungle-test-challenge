@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   db:
     image: postgres:15-alpine
@@ -10,10 +8,16 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql
-      - ./migrations/000002_add_outbox_leasing.up.sql:/docker-entrypoint-initdb.d/02_outbox.sql
-      - ./migrations/000003_add_inbox_metadata.up.sql:/docker-entrypoint-initdb.d/03_inbox.sql
-      - ./migrations/000004_add_pending_ref_worker.up.sql:/docker-entrypoint-initdb.d/04_pending_ref.sql
+      - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./migrations/000002_add_outbox_leasing.up.sql:/docker-entrypoint-initdb.d/02_outbox.sql:ro
+      - ./migrations/000003_add_inbox_metadata.up.sql:/docker-entrypoint-initdb.d/03_inbox.sql:ro
+      - ./migrations/000004_add_pending_ref_worker.up.sql:/docker-entrypoint-initdb.d/04_pending_ref.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jungle -d jungle_test && psql -U jungle -d jungle_test -c 'SELECT 1 FROM wallets LIMIT 1;' > /dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   localstack:
     image: localstack/localstack:3.8
@@ -22,6 +26,12 @@ services:
     environment:
       - SERVICES=sqs
       - AWS_DEFAULT_REGION=us-east-1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   keycloak:
     image: quay.io/keycloak/keycloak:24.0.5
@@ -37,3 +47,40 @@ services:
       - "8085:8080"
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200 OK'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DATABASE_URL=postgres://jungle:password@db:5432/jungle_test?sslmode=disable
+      - AWS_ENDPOINT=http://localstack:4566
+      - AWS_REGION=us-east-1
+      - SQS_WAGER_REQUESTS_QUEUE=wager-transactions.fifo
+      - SQS_WAGER_EVENTS_QUEUE=wager-events.fifo
+      - SQS_DLQ_QUEUE=wager-transactions-dlq.fifo
+      - KEYCLOAK_URL=http://keycloak:8080
+      - KEYCLOAK_REALM=jungle
+      - AUTH_ENABLED=true
+    depends_on:
+      db:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s

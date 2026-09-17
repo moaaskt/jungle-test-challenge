@@ -177,4 +177,3 @@ func (r *pgxLedgerRepository) ReconstructBalance(ctx context.Context, tx pgx.Tx,
 	}
 	return calculatedBalance, checkedEntries, nil
 }
-

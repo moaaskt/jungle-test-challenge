@@ -8,16 +8,16 @@ import (
 
 // Config centraliza as variáveis de ambiente essenciais para a inicialização da aplicação.
 type Config struct {
-	DatabaseURL          string
-	Port                 string
-	AWSEndpoint          string
-	AWSRegion            string
+	DatabaseURL           string
+	Port                  string
+	AWSEndpoint           string
+	AWSRegion             string
 	SQSWagerRequestsQueue string
-	SQSWagerEventsQueue  string
-	SQSDLQQueue          string
-	KeycloakURL          string
-	KeycloakRealm        string
-	AuthEnabled          bool
+	SQSWagerEventsQueue   string
+	SQSDLQQueue           string
+	KeycloakURL           string
+	KeycloakRealm         string
+	AuthEnabled           bool
 }
 
 // Load lê e valida as variáveis de ambiente obrigatórias.

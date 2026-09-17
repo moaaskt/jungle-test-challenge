@@ -324,8 +324,8 @@ func (h *Handlers) HandleGetLedger(w http.ResponseWriter, r *http.Request) {
 			"transactionId": e.TransactionID,
 			"type":          e.Type,
 			"amount":        map[string]string{"amount": e.Amount.FormattedAmount(), "currency": e.Amount.Currency()},
-			"balanceBefore":  map[string]string{"amount": e.BalanceBefore.FormattedAmount(), "currency": e.BalanceBefore.Currency()},
-			"balanceAfter":   map[string]string{"amount": e.BalanceAfter.FormattedAmount(), "currency": e.BalanceAfter.Currency()},
+			"balanceBefore": map[string]string{"amount": e.BalanceBefore.FormattedAmount(), "currency": e.BalanceBefore.Currency()},
+			"balanceAfter":  map[string]string{"amount": e.BalanceAfter.FormattedAmount(), "currency": e.BalanceAfter.Currency()},
 			"createdAt":     e.CreatedAt,
 		})
 	}

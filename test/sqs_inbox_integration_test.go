@@ -429,7 +429,7 @@ func TestSQS_Inbox_OutOfOrder_PendingReference(t *testing.T) {
 			IdempotencyKey:                 "prov-b:" + refundExtID,
 			PlayerID:                       playerID,
 			WalletID:                       wallet.ID.String(),
-			Kind:                  "REFUND",
+			Kind:                           "REFUND",
 			ReferenceExternalTransactionID: missingBetExtID,
 			Money: struct {
 				Amount   string `json:"amount"`
@@ -887,4 +887,3 @@ func TestSQS_GracefulShutdown_ReleaseVisibility(t *testing.T) {
 		t.Fatalf("expected message to be immediately available in queue (visibility released to 0s), but got 0 messages")
 	}
 }
-

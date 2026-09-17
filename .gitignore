@@ -1,2 +1,8 @@
 # Ignore planning
 .planning/
+
+# Binaries & build artifacts
+bin/
+
+# Environment files
+.env
