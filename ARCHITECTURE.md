@@ -6,18 +6,27 @@ Serviço distribuído de movimentação financeira e wagering em conformidade co
 ---
 
 ## 2. Invariantes Arquiteturais (Cross-Phase Invariants)
-1. **Money sem Float:** `Money` é representado internamente sempre em centavos (`int64`), sem nunca utilizar tipos `float32` ou `float64` para valores monetários.
+1. **Money sem Float & Limites Numéricos:** Valores monetários são manipulados rigorosamente em centavos inteiros (`int64`), utilizando o Value Object de domínio `money.Money`. O uso de números de ponto flutuante (`float32` ou `float64`) é estritamente proibido em qualquer camada da aplicação. O teto máximo representável é `math.MaxInt64` centavos (aproximadamente R$ 92 quadrilhões), e operações aritméticas (`Add`, `Sub`) validam proativamente limites numéricos para impedir overflow e underflow aritmético silencioso.
 2. **Outbox Post-Commit:** Registros do Transactional Outbox são gerados na mesma transação SQL da mutação financeira e a publicação/despacho externo só ocorre após o commit confirmado no banco de dados.
-3. **Ledger Append-Only:** A tabela `wallet_ledger_entries` é estritamente append-only. Nunca executar `UPDATE` ou `DELETE` em lançamentos do ledger (garantido por trigger de imutabilidade no PostgreSQL).
+3. **Ledger Append-Only:** A tabela `wallet_ledger_entries` é estritamente append-only. Nunca executar `UPDATE` ou `DELETE` em lançamentos do ledger (garantido por trigger de imutabilidade no PostgreSQL `trg_protect_wallet_ledger_entries`).
 4. **Idempotent Replay é Consulta:** O replay idempotente consulta o resultado originalmente persistido e o devolve (`idempotentReplay: true`), sem reprocessar regras de negócio, sem debitar/creditar saldo e sem gerar novas entradas de ledger.
 5. **Isolamento de Lock por Carteira:** A coordenação de concorrência é granular por carteira (`wallet_id`). O lock em uma carteira nunca deve bloquear ou degradar requisições para carteiras diferentes.
 
 ---
 
-## 3. Estratégia de Concorrência e Integridade Financeira
-- **Locking Granular por Linha:** As transações financeiras adquirem lock pessimista na carteira alvo via `SELECT ... WHERE id = $1 FOR UPDATE` dentro da transação SQL (`pgx.Tx` com nível `ReadCommitted`).
-- **Prevenção de Lost Updates e Deadlocks:** Como a ordenação de locks por carteira é unitária e delimitada à linha específica, não há deadlocks cruzados entre carteiras diferentes. Carteiras distintas executam simultaneamente com vazão máxima.
-- **Defesa em Profundidade:** A cláusula `UPDATE wallets SET balance = $1, version = $2 WHERE id = $4 AND version = $5` valida adicionalmente a versão antes de confirmar.
+## 3. Estratégia de Concorrência, Transações SQL e Integridade Financeira
+- **Delimitação da Transação SQL (ACID Estrito):** O ciclo de vida da transação utiliza `pgxpool.Pool` do driver `pgx/v5` sob o nível de isolamento `ReadCommitted`. A coordenação atômica no `WagerService` abrange, sob o mesmo bloco `pgx.Tx`:
+  1. Lock pessimista da carteira (`SELECT ... WHERE id = $1 FOR UPDATE`).
+  2. Validação e débito/crédito do saldo em memória (`wallet.Debit` / `wallet.Credit`).
+  3. Atualização do saldo e incremento da versão na tabela `wallets`.
+  4. Inserção do lançamento imutável na tabela `wallet_ledger_entries` (em centavos).
+  5. Inserção do registro da transação de aposta na tabela `wager_transactions`.
+  6. Inserção do registro de idempotência com hash SHA-256 canônico na tabela `idempotency_records`.
+  7. Inserção do evento de integração na tabela `outbox_events`.
+  8. Inserção da confirmação na tabela `inbox_messages` (em fluxos via mensageria SQS).
+- **Locking Granular por Linha:** As transações financeiras adquirem lock pessimista exclusivamente na linha da carteira alvo (`FOR UPDATE`). Não existe lock de tabela ou trava global em memória, assegurando paralelismo total e vazão máxima para operações em carteiras distintas.
+- **Prevenção de Lost Updates e Deadlocks:** Como cada requisição financeira bloqueia uma única carteira por vez, o risco de deadlocks circulares entre transações é nulo. Caso duas requisições disputem a mesma carteira, o PostgreSQL enfileira a segunda transação de forma determinística; a segunda transação lê o saldo atualizado e a nova versão comitada pela primeira.
+- **Defesa em Profundidade com Optimistic Lock Check:** A cláusula de atualização `UPDATE wallets SET balance = $1, version = version + 1 WHERE id = $2 AND version = $3` atua como salvaguarda adicional de consistência.
 
 ---
 
@@ -283,6 +292,255 @@ Em conformidade com a Seção 13, item 8 e OBS-01 (*"Transações em PENDING: De
 - **Resolução Segura**:
   - Se a transação já possuir lançamento no ledger (`wallet_ledger_entries`), significa que o débito/crédito ocorreu no banco mas a conexão caiu antes de atualizar o status; a transação é promovida com segurança para `PROCESSED`.
   - Se não houver lançamento no ledger, o processo crashou antes de efetivar o movimento na carteira; a transação é marcada como `FAILED` com `failureCode: "TRANSACTION_TIMEOUT"`, desbloqueando o ciclo de vida de forma atômica e consistente.
+---
 
+## 11. Composição Modular com Uber Fx & Ciclo de Vida Gracioso (Seção 13 do Edital)
 
+### 11.1. Injeção de Dependência por Construtores
+A aplicação adota o framework de injeção de dependências **Uber Fx** (`go.uber.org/fx`), eliminando o uso de variáveis globais, singletons descontrolados ou service locators:
+- Cada componente expõe uma função construtora tipada (`New...`).
+- O grafo de dependências é analisado em tempo de compilação/inicialização pelo Fx, validando a inexistência de ciclos de dependência antes de iniciar os listeners de rede.
+- Os componentes são agrupados em módulos desacoplados por camada de responsabilidade:
+  - `auth.Module`: Provedor do validador JWKS com cache em memória e middlewares HTTP.
+  - `database.Module`: Provedor do pool de conexões PostgreSQL (`*pgxpool.Pool`).
+  - `repository.Module`: Provedores dos repositórios de persistência (`WalletRepository`, `LedgerRepository`, `WagerTransactionRepository`, `IdempotencyRepository`, `OutboxRepository`, `InboxRepository`).
+  - `messaging.Module`: Provedores do cliente AWS SQS v2, provisionador automático de filas FIFO e consumidor de mensagens.
+  - `service.Module`: Provedores dos casos de uso de negócio (`WagerService`) e background workers (`OutboxRelayer`, `PendingRefResolver`, `StaleTxRecoveryWorker`).
+  - `api.Module`: Provedores do roteador HTTP, handlers REST e servidor HTTP (`*http.Server`).
 
+### 11.2. Orquestração Ordenada de Inicialização e Encerramento (`fx.Lifecycle`)
+A coordenação de inicialização e desligamento gracioso atende ao requisito mandatório da Seção 13 (*"Adicione uma verificação da composição Fx e de seu início e encerramento, incluindo liberação de recursos dos workers"*):
+
+```text
+[Startup Sequence]
+1. database.Module    -> Abre pool de conexões PostgreSQL (pgxpool)
+2. messaging.Module   -> Provisiona filas SQS FIFO e inicia cliente AWS
+3. service.Module     -> Registra workers de background (OutboxRelayer, PendingRefResolver, StaleTxRecoveryWorker)
+4. messaging.Module   -> Inicia goroutines de consumo SQS (SQSConsumer)
+5. api.Module         -> Inicia servidor HTTP (http.Server.ListenAndServe)
+```
+
+```text
+[Graceful Shutdown Sequence (Ordem Reversa)]
+1. api.Module         -> http.Server.Shutdown(ctx) rejeita novas conexões HTTP
+2. messaging.Module   -> Cancela contexto do SQSConsumer, aguarda mensagens em voo e libera visibilidade para 0s
+3. service.Module     -> Cancela contextos de background dos workers (OutboxRelayer, PendingRefResolver, StaleTxRecoveryWorker)
+4. database.Module    -> Fecha graciosamente o pool de conexões (pgxpool.Close())
+```
+
+Essa sequência impede que goroutines de background tentem acessar o banco após o encerramento do pool de conexões e assegura que mensagens em processamento não sejam abandonadas no broker sem tratamento de visibilidade.
+
+---
+
+## 12. Premissas, Decisões de Engenharia e Limitações Conhecidas
+
+### 12.1. Premissas Assumidas
+1. **Contas e Moeda Única por Carteira**: Cada carteira digital pertence exclusivamente a um único jogador (`playerId`) e opera em uma única moeda ISO 4217 (ex: `BRL`). Conversões cambiais dinâmicas durante a aposta foram mantidas fora de escopo para evitar imprecisões e taxas de conversão instáveis no fluxo crítico.
+2. **Separação de Papéis de Integração**: Provedores externos de jogos (`provider-a`, `provider-b`) não têm permissão para criar ou consultar carteiras diretamente; sua interface é restrita ao envio de apostas (`/wagering/transactions`) e consulta de suas próprias transações. A criação e auditoria de carteiras é prerrogativa do operador/serviço interno (`internal-service`).
+3. **Reconciliação como Ferramenta de Auditoria**: Em conformidade estrita com a Seção 9, a reconciliação financeira nunca muta o saldo da carteira. A integridade contábil exige que qualquer divergência seja registrada para auditoria humana e alertas do Prometheus, preservando o princípio de não-repúdio contábil.
+4. **Resolução de Referências Fora de Ordem**: O sistema tolera que eventos de `REFUND` ou `ROLLBACK` cheguem antes da aposta original, mantendo-os em `PENDING_REFERENCE` por até 60 minutos (ou 10 tentativas) antes de considerá-los permanentemente falhos (`REFERENCE_NOT_FOUND`).
+
+### 12.2. Decisões de Engenharia
+- **PostgreSQL com `pgx/v5` nativo**: Adotado em vez de ORMs como GORM ou Ent para permitir controle absoluto sobre o locking (`FOR UPDATE`, `FOR UPDATE SKIP LOCKED`), níveis de isolamento, triggers de imutabilidade e mapeamento nativo de centavos inteiros (`int64`).
+- **Hash Canônico SHA-256 no Payload**: Garante que alterações em chaves opcionais ou reordenações de campos JSON não quebrem a detecção de conflitos de idempotência, gerando erro `409 Conflict` apenas quando há divergência substancial de intenção de negócio.
+- **Leasing com Locação Temporal no Outbox**: A coluna `locked_until` combinada com `SKIP LOCKED` viabiliza escala horizontal multi-instância sem single point of failure (SPOF) e sem necessidade de eleição de líder distribuído via Raft/Etcd.
+
+### 12.3. Limitações Conhecidas e Mitigações
+- **Vazão por Jogador em Filas FIFO**: O Amazon SQS FIFO limita a taxa de transferência por partição (`MessageGroupId = walletId`) a 300 msg/s (ou 3.000 msg/s em modo High Throughput). Como cada partição corresponde a um jogador individual, essa limitação não afeta a escala global da plataforma (milhares de jogadores jogando simultaneamente utilizam partições distintas em paralelo).
+- **Relógio de Sistema para Leases**: O mecanismo de lock temporal (`locked_until`) do Outbox e do Stale Recovery Worker baseia-se no relógio do servidor PostgreSQL (`NOW()`), tornando a solução imune a discrepâncias de relógio (clock drift) entre os contêineres da aplicação.
+
+---
+
+## 13. Diagramas Arquiteturais
+
+### 13.1. Topologia de Contêineres e Componentes (C4 Container)
+
+```mermaid
+graph TB
+    subgraph Clients["Clientes e Provedores Externos"]
+        PA["Provedor A (Client Credentials)"]
+        PB["Provedor B (Client Credentials)"]
+        IS["Serviço Interno (Operador)"]
+    end
+
+    subgraph Security["Segurança e Identidade"]
+        KC["Keycloak IdP (OAuth 2.0 / OIDC)<br>Porta 8085 (Realm: jungle)"]
+    end
+
+    subgraph App["Wagering Service (Golang / Uber Fx)"]
+        HTTP["HTTP API Server (Porta 8080)<br>Mux, Middlewares, Handlers"]
+        AUTH["Auth Subsystem<br>JWKS Validator (Cache RS256)"]
+        SVC["WagerService<br>Regras de Negócio, ACID Orchestrator"]
+        OR["Outbox Relayer Worker<br>SKIP LOCKED Lease Poller"]
+        PRR["PendingRefResolver Worker<br>Dual-Moment Background"]
+        SRW["StaleTxRecoveryWorker<br>Recuperador de PENDING"]
+        CONS["SQS Consumer<br>Inbox Deduplicator, FIFO Poller"]
+    end
+
+    subgraph Storage["Persistência de Dados"]
+        PG[("PostgreSQL 15<br>wallets, ledger (append-only),<br>wager_transactions, outbox, inbox")]
+    end
+
+    subgraph Messaging["Broker Assíncrono"]
+        SQS_IN["LocalStack SQS FIFO<br>wager-transactions.fifo"]
+        SQS_OUT["LocalStack SQS FIFO<br>wager-events.fifo"]
+        SQS_DLQ["LocalStack SQS FIFO<br>wager-transactions-dlq.fifo"]
+    end
+
+    PA -->|"1. Solicita Token JWT"| KC
+    PB -->|"1. Solicita Token JWT"| KC
+    IS -->|"1. Solicita Token JWT"| KC
+
+    PA -->|"2. POST /wagering/transactions"| HTTP
+    PB -->|"2. POST /wagering/transactions"| HTTP
+    IS -->|"2. POST /wallets, GET /ledger, POST /reconciliation"| HTTP
+
+    HTTP -->|"Valida Token"| AUTH
+    AUTH -.->|"JWKS Fetch (/certs)"| KC
+    HTTP -->|"Executa Caso de Uso"| SVC
+
+    SVC -->|"Transação ACID (pgx.Tx)<br>SELECT FOR UPDATE"| PG
+    OR -->|"Reivindica Lote (SKIP LOCKED)"| PG
+    OR -->|"Despacha Eventos"| SQS_OUT
+
+    PRR -->|"Reconcilia Referências"| PG
+    SRW -->|"Recupera Transações Presas"| PG
+
+    SQS_IN -->|"Consome Lotes FIFO"| CONS
+    CONS -->|"Inbox Atômica no mesmo commit"| SVC
+    CONS -.->|"Dead-Letter após retries"| SQS_DLQ
+```
+
+### 13.2. Fluxo de Sequência: Execução de Aposta com Outbox e Lock Pessimista
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Prov as Provedor (HTTP)
+    participant API as HTTP Handler
+    participant Svc as WagerService
+    participant DB as PostgreSQL (pgx.Tx)
+    participant Relayer as Outbox Relayer
+    participant SQS as SQS (wager-events.fifo)
+
+    Prov->>API: POST /wagering/transactions (Idempotency-Key)
+    API->>API: Valida Token JWT (ProviderID == Token.ClientID)
+    API->>Svc: ProcessWager(ctx, req)
+    Svc->>DB: BEGIN TRANSACTION (ReadCommitted)
+    Svc->>DB: SELECT * FROM idempotency_records WHERE key = $1 FOR UPDATE
+    alt Chave já existe e mesmo hash
+        Svc->>DB: ROLLBACK
+        Svc-->>API: Retorna Replay Idempotente (idempotentReplay: true)
+        API-->>Prov: 200 OK (Replay Original)
+    else Nova transação
+        Svc->>DB: SELECT * FROM wallets WHERE id = $1 FOR UPDATE
+        Note over Svc,DB: Lock pessimista exclusivo na linha da carteira
+        Svc->>Svc: Valida Saldo (wallet.Debit)
+        Svc->>DB: UPDATE wallets SET balance = $1, version = version + 1
+        Svc->>DB: INSERT INTO wallet_ledger_entries (amount, type='DEBIT')
+        Svc->>DB: INSERT INTO wager_transactions (status='PROCESSED')
+        Svc->>DB: INSERT INTO idempotency_records (key, payload_hash)
+        Svc->>DB: INSERT INTO outbox_events (event_type='WagerTransactionProcessed')
+        Svc->>DB: COMMIT TRANSACTION
+        Svc-->>API: 200 OK (status: PROCESSED, idempotentReplay: false)
+        API-->>Prov: 200 OK
+        
+        par Despacho Assíncrono Outbox
+            Relayer->>DB: SELECT ... FOR UPDATE SKIP LOCKED (Claim lease)
+            Relayer->>SQS: SendMessageBatch (wager-events.fifo)
+            Relayer->>DB: UPDATE outbox_events SET status='PROCESSED'
+        end
+    end
+```
+
+### 13.3. Fluxo de Sequência: Consumo SQS via Inbox Pattern e Descarte de Replay
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SQS as SQS (wager-transactions.fifo)
+    participant Cons as SQSConsumer
+    participant Svc as WagerService
+    participant DB as PostgreSQL (pgx.Tx)
+
+    loop Polling Contínuo
+        Cons->>SQS: ReceiveMessages(Max=10, Wait=20s)
+        SQS-->>Cons: Mensagens do Jogador (FIFO)
+        
+        Cons->>Svc: ProcessSQSMessage(ctx, msg)
+        Svc->>DB: BEGIN TRANSACTION
+        Svc->>DB: SELECT * FROM inbox_messages WHERE message_id = $1
+        alt Mensagem já comitada (Replay Pós-Commit Crash)
+            Svc->>DB: ROLLBACK
+            Svc-->>Cons: IdempotentReplay: true
+            Cons->>SQS: DeleteMessage (Expurgo imediato sem erro)
+        else Nova mensagem
+            Svc->>DB: INSERT INTO inbox_messages (message_id)
+            Svc->>DB: SELECT * FROM wallets WHERE id = $1 FOR UPDATE
+            Svc->>DB: UPDATE wallets, INSERT ledger, INSERT outbox
+            Svc->>DB: COMMIT TRANSACTION
+            Cons->>SQS: DeleteMessage(receiptHandle)
+        end
+    end
+```
+
+### 13.4. Máquina de Estados da Transação de Aposta
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Criação da Transação
+    
+    PENDING --> PROCESSED: Saldo Suficiente & Executado com Sucesso
+    PENDING --> REJECTED: Regra de Negócio Inválida (ex: INSUFFICIENT_FUNDS)
+    PENDING --> PENDING_REFERENCE: Dependência Futura (REFUND/ROLLBACK antes do BET)
+    PENDING --> FAILED: Crash do Processo (Recuperado por StaleTxRecoveryWorker)
+    
+    PENDING_REFERENCE --> PROCESSED: BET Original Processado (Momento A inline ou Momento B worker)
+    PENDING_REFERENCE --> REJECTED: Expirou TTL (60 min / 10 tentativas) ou BET Falhou
+    
+    PROCESSED --> [*]: Estado Final Concluído
+    REJECTED --> [*]: Estado Final Rejeitado
+    FAILED --> [*]: Estado Final Falho
+```
+
+### 13.5. Padrão de Resolução Dual-Moment (Momento A vs Momento B)
+
+```mermaid
+graph TD
+    subgraph MomentoA["Momento A: Resolução Reativa Inline (Latência Zero)"]
+        BET_IN["Chegada da Aposta Original (BET)"] --> SAVE_BET["Persiste BET como PROCESSED"]
+        SAVE_BET --> FIND_INLINE["Busca PENDING_REFERENCE associadas<br>(via índice parcial na mesma tx SQL)"]
+        FIND_INLINE -->|"Se encontrada"| RESOLVE_NOW["Atualiza Saldo + Ledger + Outbox<br>no MESMO COMMIT da Aposta"]
+        RESOLVE_NOW --> PROCESSED_A["Transiciona Pendência para PROCESSED"]
+    end
+
+    subgraph MomentoB["Momento B: Worker Periódico de Reconciliação (Assíncrono)"]
+        TIMER["Worker Tick (a cada 10s)"] --> SCAN_DB["SELECT PENDING_REFERENCE<br>FOR UPDATE SKIP LOCKED"]
+        SCAN_DB --> CHECK_ORIGINAL{"BET Original<br>foi encontrado?"}
+        CHECK_ORIGINAL -->|"Sim (PROCESSED)"| RESOLVE_WORKER["Executa Crédito/Débito no Ledger<br>e marca PROCESSED"]
+        CHECK_ORIGINAL -->|"Não, mas TTL < 60m"| BACKOFF["Agenda Próxima Tentativa<br>com Backoff Exponencial"]
+        CHECK_ORIGINAL -->|"Não e TTL > 60m (Expirado)"| EXPIRE["Marca REJECTED (REFERENCE_NOT_FOUND)<br>e emite evento na Outbox"]
+    end
+```
+
+---
+
+## 14. Matriz de Rastreabilidade com o Edital Oficial da Jungle Gaming
+
+| Seção do Edital | Exigência Principal | Implementação na Codebase | Suíte de Testes Automatizada |
+|---|---|---|---|
+| **Seção 1: Objetivo** | Serviço de carteira e apostas concorrente e distribuído | `cmd/server/main.go`, `pkg/service/wager_service.go` | `test/api_integration_test.go` |
+| **Seção 2: Autenticação** | OIDC/OAuth 2.0 via IdP externo, token JWT, isolamento por cliente e replay proibido entre provedores | `pkg/auth/validator.go`, `pkg/auth/middleware.go` | `test/auth_oidc_integration_test.go` |
+| **Seção 3: Concorrência** | Sem lost updates, lock pessimista por carteira e isolamento | `pkg/service/wager_service.go`, `pkg/repository/wallet_repo.go` | `test/concurrency_section8_test.go` |
+| **Seção 4: Integridade** | Zero ponto flutuante, inteiros em centavos, ledger append-only | `pkg/money/money.go`, `migrations/000001_init_schema.up.sql` | `pkg/money/money_test.go`, `test/reconciliation_observability_test.go` |
+| **Seção 5: Idempotência** | Idempotency-Key, hash canônico, retorno idêntico sem efeito colateral | `pkg/idempotency/canonical.go`, `pkg/repository/idempotency_repo.go` | `pkg/idempotency/canonical_test.go`, `test/idempotency_integration_test.go` |
+| **Seção 6: Operações** | BET, WIN, REFUND, ROLLBACK com direções financeiras estritas | `pkg/service/wager_service.go`, `pkg/domain/wager_transaction.go` | `test/pending_reference_integration_test.go` |
+| **Seção 7: Ordem/Refs** | Resolução de referências fora de ordem em dois momentos | `pkg/service/pending_ref_resolver.go`, `pkg/repository/wager_transaction_repo.go` | `test/pending_reference_integration_test.go` |
+| **Seção 8: Concorrência 3x** | 3 processos simultâneos na mesma carteira com esgotamento de saldo | `pkg/service/wager_service.go` | `test/concurrency_section8_test.go` |
+| **Seção 9: API HTTP** | Endpoints padronizados com path params e cursor opaco | `pkg/api/handlers.go`, `pkg/api/server.go` | `test/query_endpoints_test.go`, `test/reconciliation_observability_test.go` |
+| **Seção 10: SQS / Inbox** | SQS FIFO, Inbox atômica, descarte de replay pós-commit | `pkg/messaging/sqs_consumer.go`, `pkg/repository/inbox_repo.go` | `test/sqs_inbox_integration_test.go` |
+| **Seção 11: Outbox** | Transactional Outbox, `FOR UPDATE SKIP LOCKED`, leasing anti-crash | `pkg/service/outbox_relayer.go`, `pkg/repository/outbox_repo.go` | `test/outbox_integration_test.go` |
+| **Seção 12: Observabilidade** | Métricas Prometheus, deep health checks e logs JSON | `pkg/metrics/metrics.go`, `pkg/api/handlers.go` | `test/reconciliation_observability_test.go` |
+| **Seção 13: Cenários Teste** | Recuperação pós-restart, Fx lifecycle, visibilidade SQS 0s, etc. | `test/fx_lifecycle_test.go`, `test/app_restart_resilience_test.go` | `test/app_restart_resilience_test.go`, `test/fx_lifecycle_test.go` |
+| **Seção 14: Avaliação** | 100 pontos distribuídos em 8 pilares comprovados | Todo o projeto | Bateria completa com `make test-race` |
+| **Seção 15: Entregáveis** | Docker Compose up --build, Makefile, go test, go vet | `Dockerfile`, `docker-compose.yml`, `Makefile`, `README.md` | `make up`, `make test-race`, `make vet`, `make fmt-check` |
