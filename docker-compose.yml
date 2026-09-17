@@ -12,3 +12,12 @@ services:
     volumes:
       - ./migrations/000001_init_schema.up.sql:/docker-entrypoint-initdb.d/01_init.sql
       - ./migrations/000002_add_outbox_leasing.up.sql:/docker-entrypoint-initdb.d/02_outbox.sql
+      - ./migrations/000003_add_inbox_metadata.up.sql:/docker-entrypoint-initdb.d/03_inbox.sql
+
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs
+      - AWS_DEFAULT_REGION=us-east-1

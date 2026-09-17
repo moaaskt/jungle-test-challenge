@@ -92,3 +92,39 @@ Para viabilizar escala horizontal sem duplicação de mensagens e sem deadlocks:
 ### 6.5. Observabilidade e Lag da Outbox
 - O método `GetLag` da camada de persistência expõe o total de eventos pendentes (`pendingCount`) e a idade do evento mais antigo aguardando despacho (`oldestPendingAge`), provendo a métrica de "atraso da outbox" exigida pela Seção 12 da especificação do desafio.
 
+---
+
+## 7. Mensageria Assíncrona AWS SQS e Padrão Inbox
+
+### 7.1. Topologia de Filas e Configurações SQS FIFO
+O serviço integra com a infraestrutura AWS SQS (LocalStack local e AWS em produção) provisionando automaticamente as seguintes filas FIFO:
+1. `wager-transactions.fifo`: Fila principal de entrada de requisições de apostas assíncronas (`WagerTransactionRequested`). Configurada com `FifoQueue: true`, `ContentBasedDeduplication: false` e `RedrivePolicy` apontando para a DLQ com `maxReceiveCount: 5`.
+2. `wager-transactions-dlq.fifo`: Fila de Dead Letter (DLQ) FIFO para retenção e quarentena de mensagens envenenadas ou erros permanentes após esgotamento de tentativas.
+3. `wager-events.fifo`: Fila de saída FIFO para onde o `OutboxRelayer` despacha os eventos transacionais de integração gerados pelo sistema (`WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged`, `WagerTransactionPendingReference`).
+
+### 7.2. Semântica de Particionamento e Deduplicação Broker-Level
+- `MessageGroupId`: Mapeado para o `playerId` (ou `aggregateId` na saída), garantindo preservação estrita de ordem sequencial por jogador/carteira, ao mesmo tempo em que permite consumo concorrente paralelo entre jogadores distintos.
+- `MessageDeduplicationId`: Na publicação de saída da Outbox, é atribuído o `eventId` imutável. Na entrada, o envelope porta o `messageId` durável.
+
+### 7.3. Padrão Inbox e Atomicidade Transacional
+- Toda mensagem recebida é registrada na tabela `inbox_messages` (`id`, `message_id`, `consumer_name`, `source`, `payload_hash`, `received_at`, `processed_at`) rigorosamente dentro da **mesma transação SQL** (`pgx.Tx`) que atualiza a carteira (`wallets`), insere o registro da aposta (`wager_transactions`), gera a entrada append-only no ledger (`wallet_ledger_entries`) e enfileira os eventos da Outbox (`outbox_events`).
+- Se houver falha ou rollback durante a execução, nada é comitado e a mensagem não entra na Inbox, permitindo retry natural pelo broker.
+
+### 7.4. Interrupção Pós-Commit e Reentrega Segura (Item 5 da Seção 13 do Desafio)
+- Se a instância sofrer interrupção após o commit bem-sucedido no PostgreSQL, mas antes da chamada a `sqs.DeleteMessage`, a mensagem será reentregue pelo SQS após o vencimento do `VisibilityTimeout`.
+- Ao receber a mensagem reentregue, o consumidor consulta a Inbox. Como o registro já foi comitado, o caso de uso detecta `IdempotentReplay: true`.
+- O consumidor **não retorna erro** e executa imediatamente a chamada `sqs.DeleteMessage(ctx, queueURL, receiptHandle)`, expurgando a duplicata da fila de forma silenciosa e idempotente, sem degradar métricas nem reenviar para DLQ.
+
+### 7.5. Mensagens com Dependência Futura (`PENDING_REFERENCE`)
+- Conforme as Seções 6.3, 6.5 e 10 do Desafio, quando uma mensagem de `REFUND` ou `ROLLBACK` chega antes da aposta original, ela é persistida com status `PENDING_REFERENCE` e o evento `WagerTransactionPendingReference` é gravado na Outbox, confirmando a Inbox na mesma transação atômica.
+- O consumidor SQS considera o registro `PENDING_REFERENCE` como um processamento com sucesso no broker e remove a mensagem da fila (`sqs.DeleteMessage`), liberando a partição FIFO e delegando a reconciliação assíncrona ao worker de resolução de referências (Fase 8).
+
+### 7.6. Rejeições de Negócio Terminais
+- Rejeições de negócio confirmadas (ex: saldo insuficiente para uma aposta) são decisões válidas e finais. O registro é persistido com status `REJECTED`, evento `WagerTransactionRejected` é emitido na Outbox e a mensagem é removida do broker (`sqs.DeleteMessage`), impedindo loops desnecessários e evitando poluição da DLQ com regras de negócio esperadas.
+
+### 7.7. Graceful Shutdown e Liberação Imediata de Visibilidade (0s)
+- Em sinal de desligamento (`SIGTERM` / `Stop`), o consumidor encerra o polling cancelando o contexto do leitor e aguarda as mensagens em voo finalizarem até o prazo do shutdown.
+- Se o prazo limite for atingido com mensagens ainda não comitadas, o consumidor aciona `sqs.ChangeMessageVisibility` com `VisibilityTimeout: 0` para cada mensagem pendente em voo.
+- As mensagens são imediatamente liberadas de volta ao broker para redistribuição instantânea por outros pods/instâncias, sem reter os 30 segundos do visibility timeout padrão. Caso a goroutine retardada termine após a liberação, ela ignora a deleção (`Skipping delete for message whose visibility was released to 0s`), preservando a integridade da fila.
+
+

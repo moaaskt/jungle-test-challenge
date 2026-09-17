@@ -9,7 +9,6 @@ import (
 var Module = fx.Options(
 	fx.Provide(
 		NewWagerService,
-		NewLogPublisher,
 		func() *OutboxRelayerConfig {
 			cfg := DefaultOutboxRelayerConfig()
 			return &cfg

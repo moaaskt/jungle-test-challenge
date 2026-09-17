@@ -47,8 +47,9 @@ func TestOutbox_TransactionalAtomicity(t *testing.T) {
 	ledgerRepo := repository.NewLedgerRepository()
 	idemRepo := repository.NewIdempotencyRepository()
 	outboxRepo := repository.NewOutboxRepository(pool)
+	inboxRepo := repository.NewInboxRepository()
 
-	svc := service.NewWagerService(pool, walletRepo, wagerRepo, ledgerRepo, idemRepo, outboxRepo)
+	svc := service.NewWagerService(pool, walletRepo, wagerRepo, ledgerRepo, idemRepo, outboxRepo, inboxRepo)
 
 	// 1. Validar que rollback descarta evento da outbox
 	tx, err := pool.Begin(ctx)
