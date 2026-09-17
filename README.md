@@ -1,6 +1,6 @@
 # Jungle Gaming — Backend Engineering Challenge
 
-> **Serviço distribuído de carteira digital e processamento de apostas (Wagering Service)** desenvolvido em conformidade absoluta com o Edital Oficial do Desafio Técnico da Jungle Gaming.
+> **Serviço distribuído de carteira digital e processamento de apostas (Wagering Service)** Desenvolvido especialmente para o desafio técnico da Jungle Gaming.
 
 [![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?style=flat&logo=go)](https://golang.org)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com)
