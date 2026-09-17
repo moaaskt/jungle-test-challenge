@@ -215,6 +215,12 @@ func (s *wagerService) processWagerInternal(ctx context.Context, req ProcessWage
 
 	// 1. Checa idempotência
 	if idemKey != "" {
+		if existingTx, err := s.wagerRepo.GetByIdempotencyKey(ctx, tx, idemKey); err == nil && existingTx != nil {
+			if existingTx.ProviderID != nil && req.ProviderID != nil && *existingTx.ProviderID != *req.ProviderID {
+				return ProcessWagerResult{}, domain.ErrCrossProviderReplay
+			}
+		}
+
 		record, err := s.idempotencyRepo.GetByKey(ctx, tx, idemKey)
 		if err != nil {
 			return ProcessWagerResult{}, fmt.Errorf("failed to check idempotency key: %w", err)
@@ -499,6 +505,12 @@ func (s *wagerService) processWagerWithInboxInternal(ctx context.Context, req Pr
 
 	// 2. Checagem de Idempotência da regra de negócio (se fornecida)
 	if idemKey != "" {
+		if existingTx, err := s.wagerRepo.GetByIdempotencyKey(ctx, tx, idemKey); err == nil && existingTx != nil {
+			if existingTx.ProviderID != nil && req.ProviderID != nil && *existingTx.ProviderID != *req.ProviderID {
+				return ProcessWagerResult{}, domain.ErrCrossProviderReplay
+			}
+		}
+
 		record, err := s.idempotencyRepo.GetByKey(ctx, tx, idemKey)
 		if err != nil {
 			return ProcessWagerResult{}, fmt.Errorf("failed to check idempotency key: %w", err)

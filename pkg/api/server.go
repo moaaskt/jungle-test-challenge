@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/moaaskt/jungle-test-challenge/pkg/auth"
 	"github.com/moaaskt/jungle-test-challenge/pkg/config"
 	"go.uber.org/fx"
 )
@@ -18,27 +19,34 @@ var Module = fx.Provide(
 func NewMux(handlers *Handlers) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Endpoints exigidos pelo desafio
-	mux.HandleFunc("POST /wallets", handlers.HandleOpenWallet)
-	mux.HandleFunc("POST /wagering/transactions", handlers.HandleWagerTransaction)
-	mux.HandleFunc("GET /health/live", handlers.HandleLiveness)
-	mux.HandleFunc("GET /health/ready", handlers.HandleReadiness)
+	// Endpoints de Carteira: Restritos exclusivamente ao serviço interno (Seção 2)
+	mux.HandleFunc("POST /wallets", auth.RequireInternal(handlers.HandleOpenWallet))
+	mux.HandleFunc("GET /wallets/{walletId}", auth.RequireInternal(handlers.HandleGetWallet))
+	mux.HandleFunc("GET /wallets/{walletId}/ledger", auth.RequireInternal(handlers.HandleGetLedger))
 
-	// Endpoints de Consulta (Seção 9 do desafio)
-	mux.HandleFunc("GET /wallets/{walletId}", handlers.HandleGetWallet)
-	mux.HandleFunc("GET /wallets/{walletId}/ledger", handlers.HandleGetLedger)
+	// Endpoints de Wagering (autenticados, com controle por provedor nos handlers)
+	mux.HandleFunc("POST /wagering/transactions", handlers.HandleWagerTransaction)
 	mux.HandleFunc("GET /wagering/transactions/{transactionId}", handlers.HandleGetTransaction)
 	mux.HandleFunc("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", handlers.HandleGetTransactionByExternal)
+
+	// Endpoints de Saúde (Públicos)
+	mux.HandleFunc("GET /health/live", handlers.HandleLiveness)
+	mux.HandleFunc("GET /health/ready", handlers.HandleReadiness)
 
 	return mux
 }
 
-func NewServer(lc fx.Lifecycle, cfg *config.Config, handlers *Handlers) *http.Server {
+func NewServer(lc fx.Lifecycle, cfg *config.Config, handlers *Handlers, validator auth.TokenValidator) *http.Server {
 	mux := NewMux(handlers)
+
+	var rootHandler http.Handler = mux
+	if validator != nil {
+		rootHandler = auth.AuthMiddleware(validator, cfg.AuthEnabled)(mux)
+	}
 
 	srv := &http.Server{
 		Addr:    fmt.Sprintf(":%s", cfg.Port),
-		Handler: mux,
+		Handler: rootHandler,
 	}
 
 	lc.Append(fx.Hook{

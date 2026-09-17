@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/moaaskt/jungle-test-challenge/pkg/auth"
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
 	"github.com/moaaskt/jungle-test-challenge/pkg/idempotency"
 	"github.com/moaaskt/jungle-test-challenge/pkg/money"
@@ -115,6 +116,16 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Validação de autorização antecipada: provedor autenticado deve corresponder ao providerId da aposta
+	// Esta checagem executa estritamente ANTES de qualquer verificação ou retorno de replay do banco de dados.
+	authCtx, ok := auth.GetAuthContext(r.Context())
+	if ok && !authCtx.IsInternal {
+		if req.ProviderID != authCtx.ProviderID {
+			h.respondError(w, http.StatusForbidden, "forbidden: authenticated client cannot operate for another provider")
+			return
+		}
+	}
+
 	amt, err := money.Parse(req.Money.Amount, req.Money.Currency)
 	if err != nil {
 		h.respondError(w, http.StatusBadRequest, fmt.Sprintf("invalid money: %v", err))
@@ -159,6 +170,10 @@ func (h *Handlers) HandleWagerTransaction(w http.ResponseWriter, r *http.Request
 	result, err := h.wagerService.ProcessWager(r.Context(), svcReq)
 
 	if err != nil {
+		if errors.Is(err, domain.ErrCrossProviderReplay) {
+			h.respondError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		if strings.Contains(err.Error(), "idempotency key conflict") {
 			h.respondError(w, http.StatusConflict, err.Error())
 			return
@@ -327,6 +342,15 @@ func (h *Handlers) HandleGetTransaction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Provedores externos só podem consultar transações pertencentes a eles mesmos
+	authCtx, ok := auth.GetAuthContext(r.Context())
+	if ok && !authCtx.IsInternal {
+		if tx.ProviderID != nil && *tx.ProviderID != authCtx.ProviderID {
+			h.respondError(w, http.StatusForbidden, "forbidden: provider can only access its own transactions")
+			return
+		}
+	}
+
 	h.respondJSON(w, http.StatusOK, h.transactionToDTO(tx))
 }
 
@@ -338,6 +362,15 @@ func (h *Handlers) HandleGetTransactionByExternal(w http.ResponseWriter, r *http
 	if providerID == "" || externalTxID == "" {
 		h.respondError(w, http.StatusBadRequest, "providerId and externalTransactionId are required")
 		return
+	}
+
+	// Provedores externos só podem consultar sua própria hierarquia de transações
+	authCtx, ok := auth.GetAuthContext(r.Context())
+	if ok && !authCtx.IsInternal {
+		if providerID != authCtx.ProviderID {
+			h.respondError(w, http.StatusForbidden, "forbidden: provider can only access its own transactions")
+			return
+		}
 	}
 
 	tx, err := h.wagerService.GetTransactionByExternal(r.Context(), providerID, externalTxID)

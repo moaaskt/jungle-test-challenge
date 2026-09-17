@@ -41,6 +41,9 @@ func runWorkerProcess(t *testing.T, args []string) WorkerResult {
 }
 
 func TestConcurrency_Section8_Spec_ThreeIndependentProcesses(t *testing.T) {
+	ts, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
 	// 0. Garante que o binário /tmp/wager_worker existe
 	compileCmd := exec.Command("go", "build", "-o", "/tmp/wager_worker", "./test/worker_cli")
 	compileCmd.Dir = ".."
@@ -62,7 +65,7 @@ func TestConcurrency_Section8_Spec_ThreeIndependentProcesses(t *testing.T) {
 		},
 	}
 	body1, _ := json.Marshal(wallet1Payload)
-	resp1, err := http.Post("http://localhost:8080/wallets", "application/json", bytes.NewReader(body1))
+	resp1, err := http.Post(ts.URL+"/wallets", "application/json", bytes.NewReader(body1))
 	if err != nil {
 		t.Fatalf("Failed to create wallet 1: %v", err)
 	}
@@ -85,7 +88,7 @@ func TestConcurrency_Section8_Spec_ThreeIndependentProcesses(t *testing.T) {
 		},
 	}
 	body2, _ := json.Marshal(wallet2Payload)
-	resp2, err := http.Post("http://localhost:8080/wallets", "application/json", bytes.NewReader(body2))
+	resp2, err := http.Post(ts.URL+"/wallets", "application/json", bytes.NewReader(body2))
 	if err != nil {
 		t.Fatalf("Failed to create wallet 2: %v", err)
 	}
@@ -99,6 +102,7 @@ func TestConcurrency_Section8_Spec_ThreeIndependentProcesses(t *testing.T) {
 	extID1 := "tx-p1-" + uuid.NewString()
 	idemKey1 := "idem-p1-" + uuid.NewString()
 	args1 := []string{
+		"-url", ts.URL + "/wagering/transactions",
 		"-wallet-id", wallet1ID,
 		"-player-id", player1ID,
 		"-external-id", extID1,
@@ -112,6 +116,7 @@ func TestConcurrency_Section8_Spec_ThreeIndependentProcesses(t *testing.T) {
 	extID2 := "tx-p2-" + uuid.NewString()
 	idemKey2 := "idem-p2-" + uuid.NewString()
 	args2 := []string{
+		"-url", ts.URL + "/wagering/transactions",
 		"-wallet-id", wallet1ID,
 		"-player-id", player1ID,
 		"-external-id", extID2,
@@ -125,6 +130,7 @@ func TestConcurrency_Section8_Spec_ThreeIndependentProcesses(t *testing.T) {
 	extID3 := "tx-p3-" + uuid.NewString()
 	idemKey3 := "idem-p3-" + uuid.NewString()
 	args3 := []string{
+		"-url", ts.URL + "/wagering/transactions",
 		"-wallet-id", wallet2ID,
 		"-player-id", player2ID,
 		"-external-id", extID3,

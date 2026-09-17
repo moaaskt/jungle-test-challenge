@@ -19,6 +19,7 @@ type WagerTransactionRepository interface {
 	Insert(ctx context.Context, tx pgx.Tx, wt *domain.WagerTransaction) error
 	GetByProviderAndExternalID(ctx context.Context, tx pgx.Tx, providerID, externalID string) (*domain.WagerTransaction, error)
 	GetByID(ctx context.Context, tx pgx.Tx, id uuid.UUID) (*domain.WagerTransaction, error)
+	GetByIdempotencyKey(ctx context.Context, tx pgx.Tx, idempotencyKey string) (*domain.WagerTransaction, error)
 	Update(ctx context.Context, tx pgx.Tx, wt *domain.WagerTransaction) error
 	GetPendingByExternalReference(ctx context.Context, tx pgx.Tx, providerID, externalRefID string) ([]*domain.WagerTransaction, error)
 	GetAllResolvable(ctx context.Context, tx pgx.Tx) ([]*PendingWithResolved, error)
@@ -211,6 +212,17 @@ func (r *pgxWagerTransactionRepository) GetByID(ctx context.Context, tx pgx.Tx, 
 	row := tx.QueryRow(ctx, query, id)
 	return scanWagerTransaction(row)
 }
+
+func (r *pgxWagerTransactionRepository) GetByIdempotencyKey(ctx context.Context, tx pgx.Tx, idempotencyKey string) (*domain.WagerTransaction, error) {
+	query := `SELECT ` + wagerTxSelectColumns + `
+		FROM wager_transactions
+		WHERE idempotency_key = $1
+		LIMIT 1
+	`
+	row := tx.QueryRow(ctx, query, idempotencyKey)
+	return scanWagerTransaction(row)
+}
+
 
 // Update persiste campos mutáveis de uma WagerTransaction após resolução.
 func (r *pgxWagerTransactionRepository) Update(ctx context.Context, tx pgx.Tx, wt *domain.WagerTransaction) error {

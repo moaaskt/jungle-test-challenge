@@ -30,6 +30,9 @@ type WagerRequest struct {
 }
 
 func TestAPI_ConcurrencyIdempotency(t *testing.T) {
+	ts, _, cleanup := setupTestServer(t)
+	defer cleanup()
+
 	// 1. Create a Wallet first
 	walletPayload := map[string]any{
 		"playerId": "conc-player-" + uuid.NewString(),
@@ -39,7 +42,7 @@ func TestAPI_ConcurrencyIdempotency(t *testing.T) {
 		},
 	}
 	body, _ := json.Marshal(walletPayload)
-	resp, err := http.Post("http://localhost:8080/wallets", "application/json", bytes.NewReader(body))
+	resp, err := http.Post(ts.URL+"/wallets", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("Failed to create wallet: %v", err)
 	}
@@ -97,7 +100,7 @@ func TestAPI_ConcurrencyIdempotency(t *testing.T) {
 			// Wait for the signal to start
 			<-startSignal
 
-			req, _ := http.NewRequest("POST", "http://localhost:8080/wagering/transactions", bytes.NewReader(reqBytes))
+			req, _ := http.NewRequest("POST", ts.URL+"/wagering/transactions", bytes.NewReader(reqBytes))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Idempotency-Key", idempotencyKey)
 

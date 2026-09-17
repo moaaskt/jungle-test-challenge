@@ -48,4 +48,8 @@ var (
 
 	// ErrReferenceNotFound é retornado quando o TTL ou máximo de tentativas expiram sem a referência aparecer.
 	ErrReferenceNotFound = errors.New("reference transaction not found within TTL")
+
+	// ErrCrossProviderReplay é retornado quando uma requisição tenta reutilizar chave de idempotência de outro provedor.
+	ErrCrossProviderReplay = errors.New("forbidden: cannot replay transaction belonging to another provider")
 )
+

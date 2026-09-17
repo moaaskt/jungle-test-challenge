@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/moaaskt/jungle-test-challenge/pkg/api"
+	"github.com/moaaskt/jungle-test-challenge/pkg/auth"
 	"github.com/moaaskt/jungle-test-challenge/pkg/config"
 	"github.com/moaaskt/jungle-test-challenge/pkg/database"
 	"github.com/moaaskt/jungle-test-challenge/pkg/messaging"
@@ -21,6 +22,7 @@ func main() {
 	app := fx.New(
 		fx.Supply(cfg),
 		fx.Provide(slog.Default),
+		auth.Module,
 		database.Module,
 		repository.Module,
 		messaging.Module,

@@ -15,6 +15,9 @@ type Config struct {
 	SQSWagerRequestsQueue string
 	SQSWagerEventsQueue  string
 	SQSDLQQueue          string
+	KeycloakURL          string
+	KeycloakRealm        string
+	AuthEnabled          bool
 }
 
 // Load lê e valida as variáveis de ambiente obrigatórias.
@@ -58,6 +61,21 @@ func Load() (*Config, error) {
 		dlqQueue = "wager-transactions-dlq.fifo"
 	}
 
+	keycloakURL := os.Getenv("KEYCLOAK_URL")
+	if keycloakURL == "" {
+		keycloakURL = "http://localhost:8085"
+	}
+
+	keycloakRealm := os.Getenv("KEYCLOAK_REALM")
+	if keycloakRealm == "" {
+		keycloakRealm = "jungle"
+	}
+
+	authEnabled := true
+	if os.Getenv("AUTH_ENABLED") == "false" {
+		authEnabled = false
+	}
+
 	return &Config{
 		DatabaseURL:           dbURL,
 		Port:                  port,
@@ -66,6 +84,9 @@ func Load() (*Config, error) {
 		SQSWagerRequestsQueue: reqQueue,
 		SQSWagerEventsQueue:   eventsQueue,
 		SQSDLQQueue:           dlqQueue,
+		KeycloakURL:           keycloakURL,
+		KeycloakRealm:         keycloakRealm,
+		AuthEnabled:           authEnabled,
 	}, nil
 }
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/moaaskt/jungle-test-challenge/pkg/api"
+	"github.com/moaaskt/jungle-test-challenge/pkg/auth"
 	"github.com/moaaskt/jungle-test-challenge/pkg/domain"
 	"github.com/moaaskt/jungle-test-challenge/pkg/repository"
 	"github.com/moaaskt/jungle-test-challenge/pkg/service"
@@ -29,7 +30,7 @@ func setupTestServer(t *testing.T) (*httptest.Server, service.WagerService, func
 	handlers := api.NewHandlers(svc)
 	mux := api.NewMux(handlers)
 
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewServer(auth.AuthMiddleware(nil, false)(mux))
 	cleanup := func() {
 		ts.Close()
 		pool.Close()

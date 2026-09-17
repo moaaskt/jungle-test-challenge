@@ -176,5 +176,54 @@ Para auditoria e integração dos operadores, o sistema provê endpoints de leit
 4. **`GET /providers/{providerId}/wagering/transactions/{externalTransactionId}`**:
    - Rota hierárquica estritamente em conformidade com o edital da Seção 9 (sem query params), suportada nativamente pelo multiplexador HTTP do Go 1.22+.
 
+---
+
+## 9. Autenticação, Autorização e Identidade OAuth 2.0 / OIDC (Seções 2, 9, 13 e 14)
+
+### 9.1. Justificativa da Escolha do IdP (Keycloak)
+Conforme exigido na Seção 2 do edital, autenticação e autorização são mandatórias e integradas a um IdP externo OAuth 2.0/OIDC. A escolha do **Keycloak** baseia-se em:
+- **Padrão de Mercado OIDC/OAuth 2.0**: Solução open source consolidada, mantida pela Red Hat/CNCF, que implementa integralmente os protocolos OpenID Connect Core 1.0 e OAuth 2.0 RFC 6749.
+- **Suporte Nativo a Machine-to-Machine (`client_credentials`)**: O fluxo ideal para comunicação inter-serviços e integração de provedores terceiros de jogos, eliminando armazenamento e manipulação de senhas de usuários humanos no escopo do sistema de carteira.
+- **Assinatura Assimétrica RS256 e Descoberta JWKS**: Tokens JWT são assinados assimetricamente pela chave privada do Keycloak. Os serviços consumidores validam a autenticidade e integridade das assinaturas consultando o endpoint público de certificados JWKS (`/protocol/openid-connect/certs`), garantindo validação descentralizada, de altíssima performance e sem chamadas síncronas de introspecção a cada requisição.
+- **Portabilidade no Docker Compose**: O Keycloak inicializa em container leve (`quay.io/keycloak/keycloak:24.0.5`) com importação declarativa e versionada do realm `jungle` (`./keycloak/realm-export.json`), viabilizando testes de integração automatizados ponta-a-ponta **sem a utilização de mocks**, em total conformidade com o critério eliminatório das Seções 13 e 14.
+
+### 9.2. Validação Criptográfica JWKS e Caching em Memória
+A camada de autenticação ([`pkg/auth/validator.go`](file:///home/moa-dev/projetos/jungletest/pkg/auth/validator.go)) implementa validação em memória de alto desempenho:
+1. **Cache Thread-Safe**: As chaves públicas RSA (`*rsa.PublicKey`) são decodificadas a partir dos módulos (`n`) e expoentes (`e`) do JWKS e armazenadas em mapa protegido por `sync.RWMutex`.
+2. **Rotação de Chaves Resiliente**: Caso um token apresente um `kid` não mapeado em cache, o validador realiza refresh dinâmico controlado por rate-limit (máximo 1 refresh a cada 2 segundos), permitindo rotação de chaves criptográficas sem indisponibilidade ou restart da aplicação.
+3. **Validação de Claims**:
+   - Algoritmo obrigatório: `RS256`.
+   - Expiração temporal: `exp` validado contra o relógio do sistema.
+   - Emissor flexível: O claim `iss` é verificado contra o sufixo `/realms/<KeycloakRealm>` e a URL base configurada via variável de ambiente (`KEYCLOAK_URL`), suportando comunicação tanto via host (`localhost:8085`) quanto via rede interna de containers (`keycloak:8080`).
+   - Identidade: O cliente autenticado é extraído preferencialmente de `azp` (Authorized Party) ou `client_id`.
+
+### 9.3. Modelo de Autorização e Isolamento por Provedor (`providerId`)
+O modelo de controle de acesso adota isolamento estrito com base na identidade autenticada no token JWT:
+1. **Serviço Interno (`internal-service`)**:
+   - Possui privilégio administrativo exclusivo para operações de carteira (`POST /wallets`, `GET /wallets/{walletId}`, `GET /wallets/{walletId}/ledger`).
+   - Pode consultar transações de qualquer provedor para fins de reconciliação e auditoria global.
+2. **Provedores de Jogos Externos (`provider-a`, `provider-b`, ...)**:
+   - **Bloqueio Total de Carteira**: Tentativas de provedores de acessar rotas de abertura ou inspeção direta de carteiras são barradas no middleware com **`403 Forbidden`**.
+   - **Isolamento de Operações de Apostas**: Ao submeter transações (`POST /wagering/transactions`), o `req.ProviderID` deve corresponder obrigatoriamente ao `ClientID` autenticado. Tentativas de operar em nome de outro provedor resultam em **`403 Forbidden`**.
+   - **Isolamento de Consultas**: Endpoints de leitura (`GET /providers/:providerId/...` e `GET /wagering/transactions/:id`) restringem a resposta apenas às transações pertencentes ao provedor autenticado.
+
+### 9.4. Proteção Contra Replay Cruzado de Idempotência (Seção 2)
+O edital define: *"Provedores acessam apenas suas próprias transações, inclusive em replays..."*. A aplicação implementa defesa em profundidade em dois níveis:
+1. **Validação Antecipada no Handler HTTP**: Antes de qualquer acesso ao banco de dados ou verificação de chaves de idempotência, o handler valida que `authCtx.ProviderID == req.ProviderID`.
+2. **Guarda de Replay Cruzado no Banco de Dados**: Caso uma chave de idempotência (`Idempotency-Key`) enviada por `provider-b` colida com uma transação já persistida originada pelo `provider-a`, o serviço detecta a divergência do provedor proprietário original através de busca indexada (`GetByIdempotencyKey`) e retorna o erro sentinela `domain.ErrCrossProviderReplay`, mapeado pelo handler diretamente para **`403 Forbidden`**. Sob nenhuma circunstância a aplicação devolve o replay ou dados de apostas de terceiros.
+
+### 9.5. Matriz de Controle de Acesso por Endpoint HTTP
+
+| Endpoint | Método | Identidade Permitida | Sem Token | Token Inválido / Expirado | Provedor Incorreto |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `/health/live` | `GET` | Público (Bypass) | `200 OK` | `200 OK` | `200 OK` |
+| `/health/ready` | `GET` | Público (Bypass) | `200 OK` | `200 OK` | `200 OK` |
+| `/wallets` | `POST` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/wallets/{walletId}` | `GET` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/wallets/{walletId}/ledger` | `GET` | `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/wagering/transactions` | `POST` | Provedor do Payload ou `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/wagering/transactions/{id}` | `GET` | Provedor Dono da Tx ou `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+| `/providers/{providerId}/wagering/transactions/{extId}` | `GET` | Provedor do Path ou `internal-service` | `401 Unauthorized` | `401 Unauthorized` | `403 Forbidden` |
+
 
 
